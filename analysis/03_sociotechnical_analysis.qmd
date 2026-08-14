@@ -1,0 +1,1155 @@
+---
+title: "Socio-technical Analysis"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# Load Data
+
+```{r}
+
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(arrow)
+library(tidyverse)
+library(easystats)
+
+# Repository-relative location for the published analysis data.
+data_dir <- file.path("..", "data")
+library(flextable)
+library(fixest)
+
+# Set working directory to script location
+if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+  doc_path <- rstudioapi::getActiveDocumentContext()$path
+  if (!is.null(doc_path) && nzchar(doc_path)) {
+    setwd(dirname(doc_path))
+  }
+}
+
+panel_complete <- read_csv(file.path(data_dir, "panel_data.csv"))
+
+panel_complete <- panel_complete %>%
+    mutate(
+      # Create PR + Issue combined metric for month t
+      prs_issues_combined_t = cumulative_prs_count_t + cumulative_issues_count_t,
+      velocity_t = (cumulative_commits_count_t + cumulative_authors_t + prs_issues_combined_t) / 3
+    )
+  
+t_plus_n_suffix <- "_t_plus_6"
+# Calculate composite velocity score only if it's the target variable
+vel_target_col     <- paste0("velocity",              t_plus_n_suffix)
+prs_iss_target_col <- paste0("prs_issues_combined",   t_plus_n_suffix)
+
+panel_complete[[prs_iss_target_col]] <-
+  panel_complete[[paste0("cumulative_prs_count",   t_plus_n_suffix)]] +
+  panel_complete[[paste0("cumulative_issues_count", t_plus_n_suffix)]]
+
+panel_complete[[vel_target_col]] <-
+  (panel_complete[[paste0("cumulative_commits_count", t_plus_n_suffix)]] +
+   panel_complete[[paste0("cumulative_authors",        t_plus_n_suffix)]] +
+   panel_complete[[prs_iss_target_col]]) / 3
+
+```
+
+# Build Models for Issues TFR Mean Hours
+
+```{r}
+
+null_model_issue_tfr <- feols(log1p(issues_tfr_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_issue_tfr)
+
+st1_model_issue_tfr <- feols(log1p(issues_tfr_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_issue_tfr)
+
+st2_model_issue_tfr <- feols(log1p(issues_tfr_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_issue_tfr)
+
+st3_model_issue_tfr <- feols(log1p(issues_tfr_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st3_edge_density) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st3_model_issue_tfr)
+
+# st1_st2_model_issue_tfr <- feols(log1p(issues_tfr_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+# 
+# summary(st1_st2_model_issue_tfr)
+
+st_all_model_issue_tfr <- feols(log1p(issues_tfr_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) + log1p(st2_developer_coverage) + log1p(st3_edge_density)| repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st_all_model_issue_tfr)
+```
+
+# Build All Null Models
+
+```{r}
+
+## Responsiveness
+
+null_model_prs_tfr <- feols(log1p(prs_tfr_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_prs_tfr)
+
+null_model_issue_ttc <- feols(log1p(issues_ttc_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_issue_ttc)
+
+null_model_prs_ttc <- feols(log1p(prs_ttc_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_prs_ttc)
+
+
+## Contributor Engagement
+
+null_model_core_contributors <- feols(log1p(num_core_contributors_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_core_contributors)
+
+null_model_new_contributors <- feols(log1p(num_new_contributors_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_new_contributors)
+
+null_model_cumulative_authors <- feols(log1p(cumulative_authors_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_cumulative_authors)
+
+
+## Knowledge Production
+
+null_model_cumulative_commits <- feols(log1p(cumulative_commits_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_cumulative_commits)
+
+
+null_model_prs_issues_combined <- feols(log1p(prs_issues_combined_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_prs_issues_combined)
+
+
+null_model_velocity <- feols(log1p(velocity_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(null_model_velocity)
+
+
+
+
+```
+
+# Build ST1 Models
+
+```{r}
+
+## Responsiveness
+
+st1_model_prs_tfr <- feols(log1p(prs_tfr_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_prs_tfr)
+
+st1_model_issue_ttc <- feols(log1p(issues_ttc_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage)| repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_issue_ttc)
+
+st1_model_prs_ttc <- feols(log1p(prs_ttc_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_prs_ttc)
+
+
+## Contributor Engagement 
+
+st1_model_core_contributors <- feols(log1p(num_core_contributors_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_core_contributors)
+
+st1_model_new_contributors <- feols(log1p(num_new_contributors_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_new_contributors)
+
+st1_model_cumulative_authors <- feols(log1p(cumulative_authors_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_cumulative_authors)
+
+
+## Knowledge Production
+
+st1_model_cumulative_commits <- feols(log1p(cumulative_commits_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_cumulative_commits)
+
+
+st1_model_prs_issues_combined <- feols(log1p(prs_issues_combined_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_prs_issues_combined)
+
+
+st1_model_velocity <- feols(log1p(velocity_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st1_supplier_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st1_model_velocity)
+
+
+```
+
+# Build ST2 Models
+
+```{r}
+
+
+## Responsiveness
+
+st2_model_prs_tfr <- feols(log1p(prs_tfr_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_prs_tfr)
+
+st2_model_issue_ttc <- feols(log1p(issues_ttc_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage)| repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_issue_ttc)
+
+st2_model_prs_ttc <- feols(log1p(prs_ttc_mean_hours_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_prs_ttc)
+
+
+## Contributor Engagement 
+
+st2_model_core_contributors <- feols(log1p(num_core_contributors_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_core_contributors)
+
+st2_model_new_contributors <- feols(log1p(num_new_contributors_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_new_contributors)
+
+st2_model_cumulative_authors <- feols(log1p(cumulative_authors_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_cumulative_authors)
+
+
+## Knowledge Production
+
+st2_model_cumulative_commits <- feols(log1p(cumulative_commits_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_cumulative_commits)
+
+
+st2_model_prs_issues_combined <- feols(log1p(prs_issues_combined_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_prs_issues_combined)
+
+
+st2_model_velocity <- feols(log1p(velocity_t_plus_6) ~ log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + log1p(social_supplier_count) + log1p(st2_developer_coverage) | repo_id + month, vcov = "twoway", data = panel_complete)
+
+summary(st2_model_velocity)
+
+
+```
+
+# Residualized ST Score Models
+
+```{r}
+
+main_control_vars <- c(
+  "cumulative_forks_t",
+  "cumulative_stars_t",
+  "age_in_months_t",
+  # "issues_cr_still_open_t",
+  # "prs_cr_still_open_t",
+  "technical_supplier_count",
+  "social_supplier_count"
+)
+
+main_target_vars <- c(
+  "issues_tfr_mean_hours_t_plus_6",
+  "prs_tfr_mean_hours_t_plus_6",
+  "issues_ttc_mean_hours_t_plus_6",
+  "prs_ttc_mean_hours_t_plus_6",
+  "num_core_contributors_t_plus_6",
+  "num_new_contributors_t_plus_6",
+  "cumulative_authors_t_plus_6",
+  "cumulative_commits_t_plus_6",
+  "prs_issues_combined_t_plus_6",
+  "velocity_t_plus_6"
+)
+
+st_score_vars <- c(
+  st1 = "st1_supplier_coverage",
+  st2 = "st2_developer_coverage",
+  st3 = "st3_edge_density"
+)
+
+residualize_st_score <- function(data, st_var, residual_controls,
+                                 entity_var = "repo_id",
+                                 time_var = "month") {
+  required_vars <- c(st_var, entity_var, time_var, residual_controls)
+  missing_vars <- setdiff(required_vars, names(data))
+
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing variables for residualization: ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+
+  data_with_id <- data %>%
+    mutate(
+      .row_id_resid = row_number(),
+      .st_resid_lhs = log1p(.data[[st_var]]),
+      across(
+        all_of(residual_controls),
+        ~ log1p(.x),
+        .names = ".resid_ctrl_{.col}"
+      )
+    )
+
+  resid_control_vars <- paste0(".resid_ctrl_", residual_controls)
+
+  resid_df <- data_with_id %>%
+    select(all_of(c(".row_id_resid", entity_var, time_var, ".st_resid_lhs", resid_control_vars))) %>%
+    drop_na() %>%
+    filter(if_all(all_of(c(".st_resid_lhs", resid_control_vars)), is.finite))
+
+  if (nrow(resid_df) < 10L) {
+    return(rep(NA_real_, nrow(data)))
+  }
+
+  resid_formula <- as.formula(
+    paste0(
+      ".st_resid_lhs ~ ",
+      paste(resid_control_vars, collapse = " + "),
+      " | ",
+      entity_var,
+      " + ",
+      time_var
+    )
+  )
+
+  resid_model <- tryCatch(
+    feols(resid_formula, data = resid_df, vcov = "twoway", fixef.rm = "none"),
+    error = function(e1) {
+      tryCatch(
+        feols(resid_formula, data = resid_df, vcov = "iid", fixef.rm = "none"),
+        error = function(e2) {
+          warning(
+            "feols() failed while residualizing ", st_var,
+            "; falling back to pooled OLS. feols error: ",
+            conditionMessage(e1)
+          )
+          lm(
+            as.formula(
+              paste0(".st_resid_lhs ~ ", paste(resid_control_vars, collapse = " + "))
+            ),
+            data = resid_df
+          )
+        }
+      )
+    }
+  )
+
+  out <- rep(NA_real_, nrow(data))
+
+  if (inherits(resid_model, "fixest")) {
+    resid_values <- residuals(resid_model)
+
+    if (length(resid_values) == nrow(resid_df)) {
+      obs_kept <- seq_len(nrow(resid_df))
+    } else {
+      obs_removed <- sort(unique(abs(unlist(resid_model$obs_selection))))
+      obs_kept <- setdiff(seq_len(nrow(resid_df)), obs_removed)
+    }
+
+    out[resid_df$.row_id_resid[obs_kept]] <- resid_values
+  } else {
+    out[resid_df$.row_id_resid] <- residuals(resid_model)
+  }
+
+  out
+}
+
+panel_complete <- panel_complete %>%
+  mutate(
+    st1_resid = residualize_st_score(
+      data = panel_complete,
+      st_var = "st1_supplier_coverage",
+      residual_controls = main_control_vars
+    ),
+    st2_resid = residualize_st_score(
+      data = panel_complete,
+      st_var = "st2_developer_coverage",
+      residual_controls = main_control_vars
+    ),
+    st3_resid = residualize_st_score(
+      data = panel_complete,
+      st_var = "st3_edge_density",
+      residual_controls = main_control_vars
+    )
+  )
+
+summary(panel_complete %>% select(st1_resid, st2_resid, st3_resid))
+
+control_rhs <- paste(paste0("log1p(", main_control_vars, ")"), collapse = " + ")
+
+build_residualized_st_model <- function(target_var, st_resid_var,
+                                        include_controls = TRUE) {
+  rhs_terms <- c(
+    st_resid_var,
+    if (include_controls) control_rhs else NULL
+  )
+
+  feols(
+    as.formula(
+      paste0(
+        "log1p(", target_var, ") ~ ",
+        paste(rhs_terms, collapse = " + "),
+        " | repo_id + month"
+      )
+    ),
+    vcov = "twoway",
+    data = panel_complete
+  )
+}
+
+residualized_st_models <- lapply(main_target_vars, function(target_var) {
+  list(
+    st1_resid = build_residualized_st_model(target_var, "st1_resid"),
+    st2_resid = build_residualized_st_model(target_var, "st2_resid"),
+    st3_resid = build_residualized_st_model(target_var, "st3_resid")
+  )
+})
+names(residualized_st_models) <- main_target_vars
+
+residualized_st_only_models <- lapply(main_target_vars, function(target_var) {
+  list(
+    st1_resid = build_residualized_st_model(target_var, "st1_resid", include_controls = FALSE),
+    st2_resid = build_residualized_st_model(target_var, "st2_resid", include_controls = FALSE),
+    st3_resid = build_residualized_st_model(target_var, "st3_resid", include_controls = FALSE)
+  )
+})
+names(residualized_st_only_models) <- main_target_vars
+
+residualized_all_st_models <- lapply(main_target_vars, function(target_var) {
+  feols(
+    as.formula(
+      paste0(
+        "log1p(", target_var, ") ~ ",
+        paste(c("st1_resid", "st2_resid", "st3_resid", control_rhs), collapse = " + "),
+        " | repo_id + month"
+      )
+    ),
+    vcov = "twoway",
+    data = panel_complete
+  )
+})
+names(residualized_all_st_models) <- main_target_vars
+
+residualized_all_st_only_models <- lapply(main_target_vars, function(target_var) {
+  feols(
+    as.formula(
+      paste0(
+        "log1p(", target_var, ") ~ st1_resid + st2_resid + st3_resid | repo_id + month"
+      )
+    ),
+    vcov = "twoway",
+    data = panel_complete
+  )
+})
+names(residualized_all_st_only_models) <- main_target_vars
+
+extract_resid_coef <- function(model, coef_name) {
+  coef_table <- coeftable(model)
+
+  if (!coef_name %in% rownames(coef_table)) {
+    return(tibble(
+      estimate = NA_real_,
+      std_error = NA_real_,
+      p_value = NA_real_
+    ))
+  }
+
+  tibble(
+    estimate = coef_table[coef_name, "Estimate"],
+    std_error = coef_table[coef_name, "Std. Error"],
+    p_value = coef_table[coef_name, "Pr(>|t|)"]
+  )
+}
+
+residualized_st_summary <- bind_rows(lapply(main_target_vars, function(target_var) {
+  bind_rows(
+    extract_resid_coef(residualized_st_models[[target_var]]$st1_resid, "st1_resid") %>%
+      mutate(target = target_var, model = "ST1 residualized with controls"),
+    extract_resid_coef(residualized_st_models[[target_var]]$st2_resid, "st2_resid") %>%
+      mutate(target = target_var, model = "ST2 residualized with controls"),
+    extract_resid_coef(residualized_st_models[[target_var]]$st3_resid, "st3_resid") %>%
+      mutate(target = target_var, model = "ST3 residualized with controls"),
+    extract_resid_coef(residualized_st_only_models[[target_var]]$st1_resid, "st1_resid") %>%
+      mutate(target = target_var, model = "ST1 residualized only"),
+    extract_resid_coef(residualized_st_only_models[[target_var]]$st2_resid, "st2_resid") %>%
+      mutate(target = target_var, model = "ST2 residualized only"),
+    extract_resid_coef(residualized_st_only_models[[target_var]]$st3_resid, "st3_resid") %>%
+      mutate(target = target_var, model = "ST3 residualized only"),
+    extract_resid_coef(residualized_all_st_models[[target_var]], "st1_resid") %>%
+      mutate(target = target_var, model = "All residualized ST: ST1"),
+    extract_resid_coef(residualized_all_st_models[[target_var]], "st2_resid") %>%
+      mutate(target = target_var, model = "All residualized ST: ST2"),
+    extract_resid_coef(residualized_all_st_models[[target_var]], "st3_resid") %>%
+      mutate(target = target_var, model = "All residualized ST: ST3"),
+    extract_resid_coef(residualized_all_st_only_models[[target_var]], "st1_resid") %>%
+      mutate(target = target_var, model = "All residualized ST only: ST1"),
+    extract_resid_coef(residualized_all_st_only_models[[target_var]], "st2_resid") %>%
+      mutate(target = target_var, model = "All residualized ST only: ST2"),
+    extract_resid_coef(residualized_all_st_only_models[[target_var]], "st3_resid") %>%
+      mutate(target = target_var, model = "All residualized ST only: ST3")
+  )
+})) %>%
+  select(target, model, estimate, std_error, p_value) %>%
+  mutate(
+    sig = case_when(
+      is.na(p_value) ~ "",
+      p_value < 0.001 ~ "***",
+      p_value < 0.01 ~ "***",
+      p_value < 0.05 ~ "**",
+      p_value < 0.1 ~ "*",
+      TRUE ~ ""
+    )
+  )
+
+print(residualized_st_summary)
+
+etable(
+  residualized_st_models$issues_tfr_mean_hours_t_plus_6$st1_resid,
+  residualized_st_models$issues_tfr_mean_hours_t_plus_6$st2_resid,
+  residualized_st_models$issues_tfr_mean_hours_t_plus_6$st3_resid,
+  residualized_all_st_models$issues_tfr_mean_hours_t_plus_6,
+  headers = c("ST1 resid", "ST2 resid", "ST3 resid", "All ST resid")
+)
+
+```
+
+# Out-of-Sample R² (Leave-One-Repo-Out Cross-Validation)
+
+```{r}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OOS R² via Leave-One-Repo-Out (LORO) CV with within-entity demeaning
+#
+# Algorithm for each hold-out repo i:
+#   1. Train the model on all repos j ≠ i  (two-way FE: repo_id + month)
+#   2. Extract structural coefficients β from the trained model
+#   3. For the hold-out repo, demean y and X by their own repo-level means,
+#      which absorbs the unobserved entity FE without requiring a training
+#      estimate of α_i
+#   4. Predict:  ŷ_dm = X_dm · β
+#   5. OOS residual:  e = y_dm − ŷ_dm
+#
+# Aggregate OOS R² = 1 − Σe² / Σy_dm²  (pooled across all hold-out repos)
+# ─────────────────────────────────────────────────────────────────────────────
+
+oos_r2_logo <- function(data,
+                         target_var,
+                         full_rhs,
+                         entity_var = "repo_id",
+                         time_var = "month") {
+
+  repos <- sort(unique(data[[entity_var]]))
+  if (length(repos) < 3L) return(NA_real_)
+
+  full_formula <- as.formula(paste0("log1p(", target_var, ") ~ ", full_rhs))
+
+  # Parse structural RHS (before the first "|") into individual terms
+  struct_rhs <- trimws(strsplit(full_rhs, "\\|")[[1L]][1L])
+  raw_terms  <- trimws(strsplit(struct_rhs, "\\+")[[1L]])
+  beta_names <- raw_terms                                       # e.g. "log1p(x)"
+  pred_vars  <- gsub("^log1p\\((.+)\\)$", "\\1", raw_terms)   # e.g. "x"
+
+  missing_in_data <- setdiff(c(target_var, pred_vars, time_var), names(data))
+  if (length(missing_in_data) > 0L) {
+    warning("Variables not found in data: ",
+            paste(missing_in_data, collapse = ", "))
+    return(NA_real_)
+  }
+
+  all_e2   <- numeric(0)
+  all_ydm2 <- numeric(0)
+
+  for (repo in repos) {
+    train_data <- data[data[[entity_var]] != repo, , drop = FALSE]
+    test_data  <- data[data[[entity_var]] == repo, , drop = FALSE]
+
+    if (nrow(test_data) < 2L) next
+
+    # Fit on N−1 repos; iid vcov is sufficient (only point estimates needed)
+    model <- tryCatch(
+      feols(full_formula, data = train_data, vcov = "iid"),
+      error = function(e) NULL
+    )
+    if (is.null(model)) next
+
+    # Extract coefficients in the order that matches beta_names
+    beta <- tryCatch(coef(model)[beta_names], error = function(e) NULL)
+    if (is.null(beta) || anyNA(beta)) next
+
+    # Build log1p-transformed y and X for the hold-out repo
+    y_raw <- log1p(test_data[[target_var]])
+    X_raw <- vapply(
+      setNames(pred_vars, beta_names),
+      function(v) log1p(test_data[[v]]),
+      numeric(nrow(test_data))
+    )
+    # vapply returns a vector when nrow == 1; normalise to matrix
+    if (!is.matrix(X_raw))
+      X_raw <- matrix(X_raw, nrow = nrow(test_data),
+                      dimnames = list(NULL, beta_names))
+
+    valid <- is.finite(y_raw) & rowSums(!is.finite(X_raw)) == 0L
+    if (sum(valid) < 2L) next
+
+    y_test <- y_raw[valid]
+    X_test <- X_raw[valid, , drop = FALSE]
+    time_test <- test_data[[time_var]][valid]
+
+    time_fe <- tryCatch(fixef(model)[[time_var]], error = function(e) NULL)
+    time_hat <- rep(0, length(y_test))
+
+    if (!is.null(time_fe)) {
+      time_hat <- unname(time_fe[as.character(time_test)])
+      valid_time <- is.finite(time_hat)
+
+      if (sum(valid_time) < 2L) next
+
+      y_test <- y_test[valid_time]
+      X_test <- X_test[valid_time, , drop = FALSE]
+      time_hat <- time_hat[valid_time]
+    }
+
+    # Within-entity demean — absorbs the unobserved entity fixed effect
+    y_dm     <- y_test - mean(y_test)
+    X_dm     <- sweep(X_test, 2L, colMeans(X_test), "-")
+    # Center month FE so it is on the same held-out repo-demeaned scale.
+    time_dm  <- time_hat - mean(time_hat)
+
+    ypred_dm <- as.vector(X_dm %*% beta) + time_dm
+    e        <- y_dm - ypred_dm
+
+    all_e2   <- c(all_e2,   e^2)
+    all_ydm2 <- c(all_ydm2, y_dm^2)
+  }
+
+  if (length(all_e2) == 0L || sum(all_ydm2) == 0) return(NA_real_)
+  1 - sum(all_e2) / sum(all_ydm2)
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model specifications (mirroring the main analysis)
+# ─────────────────────────────────────────────────────────────────────────────
+
+base_controls_oos <- paste0(
+  "log1p(cumulative_forks_t) + log1p(cumulative_stars_t) + ",
+  "log1p(age_in_months_t) + log1p(issues_cr_still_open_t) + ",
+  "log1p(prs_cr_still_open_t) + log1p(technical_supplier_count) + ",
+  "log1p(social_supplier_count)"
+)
+
+model_rhs_oos <- list(
+  null   = paste0(base_controls_oos,
+                  " | repo_id + month"),
+  st1    = paste0(base_controls_oos,
+                  " + log1p(st1_supplier_coverage) | repo_id + month"),
+  st2    = paste0(base_controls_oos,
+                  " + log1p(st2_developer_coverage) | repo_id + month"),
+  st3    = paste0(base_controls_oos,
+                  " + log1p(st3_edge_density) | repo_id + month"),
+  st_all = paste0(base_controls_oos,
+                  " + log1p(st1_supplier_coverage)",
+                  " + log1p(st2_developer_coverage)",
+                  " + log1p(st3_edge_density) | repo_id + month")
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compute OOS R² for every target × model-spec combination
+# ─────────────────────────────────────────────────────────────────────────────
+
+message("Computing OOS R\u00b2 via leave-one-repo-out CV ...")
+message("(Depending on the number of repos this may take a few minutes.)\n")
+
+oos_r2_results <- bind_rows(lapply(main_target_vars, function(target) {
+  message("  Target: ", target)
+  bind_cols(
+    tibble(target = target),
+    as_tibble(lapply(model_rhs_oos, function(rhs) {
+      oos_r2_logo(data = panel_complete, target_var = target, full_rhs = rhs)
+    }))
+  )
+}))
+
+print(oos_r2_results)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary table: raw OOS R²
+# ─────────────────────────────────────────────────────────────────────────────
+
+oos_r2_display <- oos_r2_results %>%
+  mutate(
+    target = str_remove(target, "_t_plus_6"),
+    across(where(is.numeric), ~ round(.x, 4))
+  )
+
+flextable(oos_r2_display) %>%
+  set_header_labels(
+    target = "Outcome",
+    null   = "Null",
+    st1    = "ST1",
+    st2    = "ST2",
+    st3    = "ST3",
+    st_all = "All ST"
+  ) %>%
+  set_caption("Out-of-Sample R\u00b2 (Leave-One-Repo-Out CV, repo demeaning + centered training month FE)") %>%
+  colformat_double(digits = 4) %>%
+  autofit()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary table: incremental OOS R² (Δ over null model)
+# ─────────────────────────────────────────────────────────────────────────────
+
+oos_r2_delta <- oos_r2_results %>%
+  mutate(
+    target      = str_remove(target, "_t_plus_6"),
+    delta_st1   = round(st1   - null, 4),
+    delta_st2   = round(st2   - null, 4),
+    delta_st3   = round(st3   - null, 4),
+    delta_st_all = round(st_all - null, 4),
+    null        = round(null, 4)
+  ) %>%
+  select(target, null, delta_st1, delta_st2, delta_st3, delta_st_all)
+
+flextable(oos_r2_delta) %>%
+  set_header_labels(
+    target       = "Outcome",
+    null         = "OOS R\u00b2 (Null)",
+    delta_st1    = "\u0394 ST1",
+    delta_st2    = "\u0394 ST2",
+    delta_st3    = "\u0394 ST3",
+    delta_st_all = "\u0394 All ST"
+  ) %>%
+  set_caption("Incremental OOS R\u00b2 relative to null model (\u0394 = ST model \u2212 Null)") %>%
+  colformat_double(digits = 4) %>%
+  autofit()
+
+```
+
+# ST1 and ST2 Within-R2 Incremental Explanatory Power
+
+```{r}
+
+extract_oos_rhs_parts <- function(full_rhs) {
+  struct_rhs <- trimws(strsplit(full_rhs, "\\|")[[1L]][1L])
+  raw_terms <- trimws(strsplit(struct_rhs, "\\+")[[1L]])
+  pred_vars <- gsub("^log1p\\((.+)\\)$", "\\1", raw_terms)
+
+  list(
+    struct_rhs = struct_rhs,
+    pred_vars = pred_vars
+  )
+}
+
+build_same_sample_model_df <- function(data,
+                                       target_var,
+                                       full_rhs,
+                                       entity_var = "repo_id",
+                                       time_var = "month") {
+  rhs_parts <- extract_oos_rhs_parts(full_rhs)
+  required_vars <- unique(c(target_var, rhs_parts$pred_vars, entity_var, time_var))
+  missing_vars <- setdiff(required_vars, names(data))
+
+  if (length(missing_vars) > 0L) {
+    stop("Variables not found in data: ", paste(missing_vars, collapse = ", "))
+  }
+
+  data %>%
+    select(all_of(required_vars)) %>%
+    drop_na() %>%
+    filter(
+      is.finite(log1p(.data[[target_var]])),
+      if_all(all_of(rhs_parts$pred_vars), ~ is.finite(log1p(.x)))
+    )
+}
+
+compute_within_r2_delta <- function(data,
+                                    target_var,
+                                    st_full_rhs,
+                                    null_full_rhs,
+                                    model_name,
+                                    entity_var = "repo_id",
+                                    time_var = "month") {
+  model_df <- build_same_sample_model_df(
+    data = data,
+    target_var = target_var,
+    full_rhs = st_full_rhs,
+    entity_var = entity_var,
+    time_var = time_var
+  )
+
+  if (nrow(model_df) < 10L) {
+    return(tibble(
+      target = target_var,
+      model = model_name,
+      n_obs = nrow(model_df),
+      n_repo = n_distinct(model_df[[entity_var]]),
+      n_month = n_distinct(model_df[[time_var]]),
+      wr2_null = NA_real_,
+      wr2_st = NA_real_,
+      delta_wr2 = NA_real_
+    ))
+  }
+
+  st_model <- tryCatch(
+    feols(
+      as.formula(paste0("log1p(", target_var, ") ~ ", st_full_rhs)),
+      data = model_df,
+      vcov = "iid"
+    ),
+    error = function(e) NULL
+  )
+
+  null_model <- tryCatch(
+    feols(
+      as.formula(paste0("log1p(", target_var, ") ~ ", null_full_rhs)),
+      data = model_df,
+      vcov = "iid"
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(st_model) || is.null(null_model)) {
+    return(tibble(
+      target = target_var,
+      model = model_name,
+      n_obs = nrow(model_df),
+      n_repo = n_distinct(model_df[[entity_var]]),
+      n_month = n_distinct(model_df[[time_var]]),
+      wr2_null = NA_real_,
+      wr2_st = NA_real_,
+      delta_wr2 = NA_real_
+    ))
+  }
+
+  wr2_null <- unname(fixest::r2(null_model, type = "wr2"))
+  wr2_st <- unname(fixest::r2(st_model, type = "wr2"))
+
+  tibble(
+    target = target_var,
+    model = model_name,
+    n_obs = nobs(st_model),
+    n_repo = n_distinct(model_df[[entity_var]]),
+    n_month = n_distinct(model_df[[time_var]]),
+    wr2_null = wr2_null,
+    wr2_st = wr2_st,
+    delta_wr2 = wr2_st - wr2_null
+  )
+}
+
+within_r2_incremental_summary <- bind_rows(lapply(main_target_vars, function(target) {
+  bind_rows(
+    compute_within_r2_delta(
+      data = panel_complete,
+      target_var = target,
+      st_full_rhs = model_rhs_oos$st1,
+      null_full_rhs = model_rhs_oos$null,
+      model_name = "ST1"
+    ),
+    compute_within_r2_delta(
+      data = panel_complete,
+      target_var = target,
+      st_full_rhs = model_rhs_oos$st2,
+      null_full_rhs = model_rhs_oos$null,
+      model_name = "ST2"
+    )
+  )
+}))
+
+within_r2_incremental_display <- within_r2_incremental_summary %>%
+  mutate(
+    outcome = str_remove(target, "_t_plus_6"),
+    across(c(wr2_null, wr2_st, delta_wr2), ~ round(.x, 4))
+  ) %>%
+  select(outcome, model, n_obs, n_repo, n_month, wr2_null, wr2_st, delta_wr2)
+
+print(within_r2_incremental_display)
+
+flextable(within_r2_incremental_display) %>%
+  set_header_labels(
+    outcome = "Outcome",
+    model = "Model",
+    n_obs = "N",
+    n_repo = "Repos",
+    n_month = "Months",
+    wr2_null = "Null Within R2",
+    wr2_st = "ST Within R2",
+    delta_wr2 = "Delta Within R2"
+  ) %>%
+  set_caption("Incremental within-repo R2 for ST1 and ST2 relative to same-sample null models") %>%
+  colformat_double(digits = 4) %>%
+  autofit()
+
+```
+
+# Within-R2 Reconciliation Diagnostics
+
+```{r}
+
+add_misq_composites <- function(data, suffix = "_t_plus_6") {
+  prs_iss_col <- paste0("prs_issues_combined", suffix)
+  vel_col <- paste0("velocity", suffix)
+  prs_count_col <- paste0("cumulative_prs_count", suffix)
+  issues_count_col <- paste0("cumulative_issues_count", suffix)
+  commits_col <- paste0("cumulative_commits_count", suffix)
+  authors_col <- paste0("cumulative_authors", suffix)
+
+  if (!prs_iss_col %in% names(data) &&
+      all(c(prs_count_col, issues_count_col) %in% names(data))) {
+    data[[prs_iss_col]] <- data[[prs_count_col]] + data[[issues_count_col]]
+  }
+
+  if (!vel_col %in% names(data) &&
+      all(c(commits_col, authors_col, prs_iss_col) %in% names(data))) {
+    data[[vel_col]] <- (data[[commits_col]] + data[[authors_col]] + data[[prs_iss_col]]) / 3
+  }
+
+  data
+}
+
+count_within_r2_complete_cases <- function(data,
+                                           target_var,
+                                           st_var,
+                                           control_rhs,
+                                           entity_var = "repo_id",
+                                           time_var = "month") {
+  rhs_parts <- extract_oos_rhs_parts(paste0(control_rhs, " + log1p(", st_var, ") | ", entity_var, " + ", time_var))
+  required_vars <- unique(c(target_var, rhs_parts$pred_vars, entity_var, time_var))
+
+  if (!all(required_vars %in% names(data))) return(NA_integer_)
+
+  data %>%
+    select(all_of(required_vars)) %>%
+    drop_na() %>%
+    filter(
+      is.finite(log1p(.data[[target_var]])),
+      if_all(all_of(rhs_parts$pred_vars), ~ is.finite(log1p(.x)))
+    ) %>%
+    nrow()
+}
+
+if (file.exists(file.path(data_dir, "predictive_dataset_6month_forward.csv"))) {
+  socio_panel_for_reconciliation <- read_csv(
+    file.path(data_dir, "predictive_dataset_6month_forward.csv"),
+    show_col_types = FALSE
+  ) %>%
+    add_misq_composites(t_plus_n_suffix)
+
+  within_r2_sample_reconciliation <- bind_rows(lapply(main_target_vars, function(target) {
+    tibble(
+      target = target,
+      misq_panel_st1_n = count_within_r2_complete_cases(
+        panel_complete, target, "st1_supplier_coverage", base_controls_oos
+      ),
+      socio_predictive_st1_n = count_within_r2_complete_cases(
+        socio_panel_for_reconciliation, target, "st1_supplier_coverage", base_controls_oos
+      ),
+      misq_panel_st2_n = count_within_r2_complete_cases(
+        panel_complete, target, "st2_developer_coverage", base_controls_oos
+      ),
+      socio_predictive_st2_n = count_within_r2_complete_cases(
+        socio_panel_for_reconciliation, target, "st2_developer_coverage", base_controls_oos
+      )
+    )
+  })) %>%
+    mutate(
+      target = str_remove(target, "_t_plus_6"),
+      st1_n_difference = socio_predictive_st1_n - misq_panel_st1_n,
+      st2_n_difference = socio_predictive_st2_n - misq_panel_st2_n
+    )
+
+  print(within_r2_sample_reconciliation)
+
+  flextable(within_r2_sample_reconciliation) %>%
+    set_header_labels(
+      target = "Outcome",
+      misq_panel_st1_n = "MISQ ST1 N",
+      socio_predictive_st1_n = "Socio ST1 N",
+      st1_n_difference = "ST1 N Diff.",
+      misq_panel_st2_n = "MISQ ST2 N",
+      socio_predictive_st2_n = "Socio ST2 N",
+      st2_n_difference = "ST2 N Diff."
+    ) %>%
+    set_caption("Within-R2 sample reconciliation: MISQ panel_data.csv vs Socio-technical predictive dataset") %>%
+    autofit()
+} else {
+  message("predictive_dataset_6month_forward.csv not found; skipping within-R2 sample reconciliation.")
+}
+
+```
+
+# Correlation Between Within-R2 Delta and OOS Delta R2
+
+```{r}
+
+safe_cor <- function(x, y, method = "pearson") {
+  keep <- is.finite(x) & is.finite(y)
+
+  if (sum(keep) < 2L) return(NA_real_)
+  if (sd(x[keep]) == 0 || sd(y[keep]) == 0) return(NA_real_)
+
+  unname(cor(x[keep], y[keep], method = method))
+}
+
+within_delta_wide <- within_r2_incremental_summary %>%
+  select(target, model, delta_wr2) %>%
+  mutate(
+    model = case_when(
+      model == "ST1" ~ "within_delta_st1",
+      model == "ST2" ~ "within_delta_st2",
+      TRUE ~ model
+    )
+  ) %>%
+  pivot_wider(names_from = model, values_from = delta_wr2)
+
+oos_delta_wide <- oos_r2_results %>%
+  transmute(
+    target,
+    oos_delta_st1 = st1 - null,
+    oos_delta_st2 = st2 - null
+  )
+
+within_oos_delta_correlation_data <- within_delta_wide %>%
+  inner_join(oos_delta_wide, by = "target")
+
+within_oos_delta_correlation_long <- bind_rows(
+  within_oos_delta_correlation_data %>%
+    transmute(
+      target,
+      model = "ST1",
+      within_delta_wr2 = within_delta_st1,
+      oos_delta_r2 = oos_delta_st1
+    ),
+  within_oos_delta_correlation_data %>%
+    transmute(
+      target,
+      model = "ST2",
+      within_delta_wr2 = within_delta_st2,
+      oos_delta_r2 = oos_delta_st2
+    )
+) %>%
+  filter(is.finite(within_delta_wr2), is.finite(oos_delta_r2))
+
+within_oos_delta_correlations_by_model <- within_oos_delta_correlation_long %>%
+  group_by(model) %>%
+  summarise(
+    n = n(),
+    pearson_r = safe_cor(within_delta_wr2, oos_delta_r2, method = "pearson"),
+    spearman_r = safe_cor(within_delta_wr2, oos_delta_r2, method = "spearman"),
+    .groups = "drop"
+  )
+
+within_oos_delta_correlations_pooled <- within_oos_delta_correlation_long %>%
+  summarise(
+    model = "ST1 + ST2 pooled",
+    n = n(),
+    pearson_r = safe_cor(within_delta_wr2, oos_delta_r2, method = "pearson"),
+    spearman_r = safe_cor(within_delta_wr2, oos_delta_r2, method = "spearman")
+  )
+
+within_oos_delta_correlations <- bind_rows(
+  within_oos_delta_correlations_by_model,
+  within_oos_delta_correlations_pooled
+) %>%
+  mutate(across(c(pearson_r, spearman_r), ~ round(.x, 4)))
+
+print(within_oos_delta_correlation_long)
+print(within_oos_delta_correlations)
+
+flextable(within_oos_delta_correlations) %>%
+  set_header_labels(
+    model = "Model",
+    n = "N",
+    pearson_r = "Pearson r",
+    spearman_r = "Spearman rho"
+  ) %>%
+  set_caption("Correlation between incremental within-repo R2 and repo-held-out OOS delta R2") %>%
+  colformat_double(digits = 4) %>%
+  autofit()
+
+```
+
+# Recommended Repo-Held-Out TWFE OOS R2
+
+```{r}
+
+# This chunk makes the recommended OOS performance estimate explicit:
+# leave one repo out, fit the two-way FE model on the remaining repos,
+# predict held-out repo deviations from its own mean, and include the
+# training-estimated month fixed effects centered within that held-out repo.
+
+if (!exists("oos_r2_results")) {
+  message("Computing recommended repo-held-out TWFE OOS R2 ...")
+
+  oos_r2_results <- bind_rows(lapply(main_target_vars, function(target) {
+    message("  Target: ", target)
+    bind_cols(
+      tibble(target = target),
+      as_tibble(lapply(model_rhs_oos, function(rhs) {
+        oos_r2_logo(data = panel_complete, target_var = target, full_rhs = rhs)
+      }))
+    )
+  }))
+}
+
+recommended_repo_holdout_twfe_oos_r2 <- oos_r2_results
+
+recommended_repo_holdout_twfe_display <- recommended_repo_holdout_twfe_oos_r2 %>%
+  mutate(
+    target = str_remove(target, "_t_plus_6"),
+    across(where(is.numeric), ~ round(.x, 4))
+  )
+
+print(recommended_repo_holdout_twfe_display)
+
+flextable(recommended_repo_holdout_twfe_display) %>%
+  set_header_labels(
+    target = "Outcome",
+    null   = "Null",
+    st1    = "ST1",
+    st2    = "ST2",
+    st3    = "ST3",
+    st_all = "All ST"
+  ) %>%
+  set_caption("Recommended OOS R2: repo-held-out TWFE with repo demeaning and centered training month FE") %>%
+  colformat_double(digits = 4) %>%
+  autofit()
+
+recommended_repo_holdout_twfe_delta <- recommended_repo_holdout_twfe_oos_r2 %>%
+  mutate(
+    target       = str_remove(target, "_t_plus_6"),
+    delta_st1    = round(st1 - null, 4),
+    delta_st2    = round(st2 - null, 4),
+    delta_st3    = round(st3 - null, 4),
+    delta_st_all = round(st_all - null, 4),
+    null         = round(null, 4)
+  ) %>%
+  select(target, null, delta_st1, delta_st2, delta_st3, delta_st_all)
+
+print(recommended_repo_holdout_twfe_delta)
+
+flextable(recommended_repo_holdout_twfe_delta) %>%
+  set_header_labels(
+    target       = "Outcome",
+    null         = "OOS R2 (Null)",
+    delta_st1    = "Delta ST1",
+    delta_st2    = "Delta ST2",
+    delta_st3    = "Delta ST3",
+    delta_st_all = "Delta All ST"
+  ) %>%
+  set_caption("Recommended incremental OOS R2 relative to the null model") %>%
+  colformat_double(digits = 4) %>%
+  autofit()
+
+```

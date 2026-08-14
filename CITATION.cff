@@ -1,0 +1,6 @@
+cff-version: 1.2.0
+message: "If you use this framework, please cite the repository and the accompanying study."
+title: "Augur Socio-technical Data Framework"
+type: software
+license: CC-BY-SA-4.0
+abstract: "Reproducible scripts and sanitized, aggregate project-level data for socio-technical open-source software analyses using Augur."

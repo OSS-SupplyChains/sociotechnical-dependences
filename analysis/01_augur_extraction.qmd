@@ -1,0 +1,3061 @@
+---
+title: "Augur Postgres"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## DB Connection
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+Here, we start with connecting to the database.
+
+```{r}
+library(DBI)
+library(RPostgres)
+library(tidyverse)
+
+# set your working directory to the current file directory 
+tryCatch({
+  setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+  }, error=function(cond){message(paste("cannot change working directory"))
+})
+
+# Repository-relative location for the published data artifacts.
+data_dir <- file.path("..", "data")
+
+# Connection settings are read from local environment variables; never commit credentials.
+augur_db_password <- Sys.getenv("AUGUR_DB_PASSWORD")
+if (!nzchar(augur_db_password)) {
+  stop("Set AUGUR_DB_PASSWORD in your local environment before rendering this notebook.")
+}
+
+# Adjust these to match your Docker Postgres configuration.
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host = Sys.getenv("AUGUR_DB_HOST", "localhost"),
+  port = as.integer(Sys.getenv("AUGUR_DB_PORT", "5432")),
+  dbname = Sys.getenv("AUGUR_DB_NAME", "augur"),
+  user = Sys.getenv("AUGUR_DB_USER", "augur"),
+  password = augur_db_password
+)
+
+# Basic identity & context
+dbGetQuery(con, "SELECT current_database() AS db, current_user AS usr,
+                        inet_server_addr()::text AS host, inet_server_port() AS port;")
+
+
+dbGetQuery(con, "SHOW search_path;")
+
+# What schemas exist?
+dbGetQuery(con, "SELECT schema_name FROM information_schema.schemata ORDER BY 1;")
+
+# Where is the repo table actually located?
+dbGetQuery(con, "
+  SELECT table_schema, table_name
+  FROM information_schema.tables
+  WHERE table_name IN ('repo','repo_groups')
+  ORDER BY 1,2;
+")
+
+```
+
+```{r}
+
+dbGetQuery(con, "SELECT COUNT(*) AS repos FROM augur_data.repo;")
+dbGetQuery(con, "SELECT COUNT(*) AS commits FROM augur_data.commits;")
+dbGetQuery(con, "SELECT COUNT(*) AS issues FROM augur_data.issues;")
+dbGetQuery(con, "SELECT COUNT(*) AS messages FROM augur_data.message;")
+
+```
+
+## List current collection status
+
+```{r}
+
+current_db_status <- dbGetQuery(con, " WITH cs AS (
+  SELECT r.repo_id, r.repo_git,
+         cs.core_status, cs.secondary_status, cs.facade_status,
+         cs.core_data_last_collected, cs.secondary_data_last_collected, cs.facade_data_last_collected
+  FROM augur_data.repo r
+  LEFT JOIN augur_operations.collection_status cs ON cs.repo_id = r.repo_id
+)
+SELECT repo_id, repo_git, core_status, secondary_status, facade_status,
+       core_data_last_collected, secondary_data_last_collected, facade_data_last_collected
+FROM cs
+ORDER BY COALESCE(GREATEST(
+  COALESCE(core_data_last_collected,'epoch'::timestamp),
+  COALESCE(secondary_data_last_collected,'epoch'::timestamp),
+  COALESCE(facade_data_last_collected,'epoch'::timestamp)
+),'epoch'::timestamp) DESC
+LIMIT 200;
+")
+current_db_status
+
+```
+
+```{r}
+
+# Query to get current worker activity and status
+query <- "
+SELECT
+    worker,
+    COUNT(*) AS active_tasks,
+    MAX(status) AS current_status
+FROM
+    augur_operations.worker_history
+GROUP BY
+    worker
+ORDER BY
+    active_tasks DESC;
+"
+
+# Execute the query
+worker_status <- dbGetQuery(con, query)
+
+# Print the results
+print(worker_status)
+
+```
+
+## GitHub authentication
+
+GitHub credentials are intentionally not stored in this repository. Configure authentication directly in your local Augur/Docker deployment before collection.
+
+```{r}
+
+# Check overall collection status
+overall_status <- dbGetQuery(con, "
+SELECT
+  cs.secondary_status,
+  cs.facade_status,
+  COUNT(*) as num_repos
+FROM augur_operations.collection_status cs
+GROUP BY cs.secondary_status, cs.facade_status
+ORDER BY num_repos DESC;
+")
+
+print(overall_status)
+
+# Check specifically the repos from your batch
+batch_repos <- dbGetQuery(con, "
+SELECT
+  r.repo_git,
+  cs.secondary_status,
+  cs.facade_status,
+  cs.secondary_data_last_collected,
+  cs.facade_data_last_collected
+FROM augur_data.repo r
+JOIN augur_operations.collection_status cs ON r.repo_id = cs.repo_id
+WHERE r.repo_git IN (
+  'https://github.com/argoproj/argo-cd',
+  'https://github.com/containerd/containerd',
+  'https://github.com/artifacthub/hub',
+  'https://github.com/v6d-io/v6d'
+)
+ORDER BY r.repo_git;
+")
+
+print(batch_repos)
+
+```
+
+# Read Parquet File for important repos
+
+```{r}
+library(arrow)
+
+st_scores <- read_parquet(file.path(data_dir, "cncf_sociotechnical_scores.parquet"))
+
+```
+
+Let's create an aggregate ST score column, aggregate the repos by average aggregate ST score, and create bins of high vs low ST scores.
+
+- File shows 3 ways to quantify socio-technical dependencies
+
+- Want to understand temporal dependencies, e.g., if a score in one month is predictive of something else
+
+```{r}
+
+library(dplyr)
+
+# add column of sum of ST score
+st_scores <- st_scores %>% 
+  mutate(st_sum = rowSums(select(.,st1_supplier_coverage,st2_developer_coverage,st3_edge_density)))
+
+
+# group by cncf_repo_name and calculate average st_scores
+st_scores_aggregated <- st_scores %>% 
+  group_by(cncf_repo_name) %>% 
+  summarize(mean_st_score = mean(st_sum, na.rm = T))
+
+# create histogram of st_scores
+library(ggplot2)
+
+st_sum_histogram <- ggplot(st_scores_aggregated, aes(x=mean_st_score)) + 
+  geom_histogram()
+
+st_sum_histogram
+```
+
+Now, create a bin of the top 20 and bottom 20 percent:
+
+```{r}
+repos_least_st_score <- st_scores_aggregated %>%
+  slice_min(order_by = mean_st_score, prop = 0.20)
+
+repos_highest_st_score <- st_scores_aggregated %>%
+  slice_max(order_by = mean_st_score, prop = 0.20)
+
+```
+
+# Analyses
+
+Here, we start calculating some of the core sustainability and health metrics. We do this only for repositories that have a Success status for Core, Secondary, and Facade.
+
+## Configuration: Filter by Repository Groups
+
+Set the repository groups you want to analyze. Leave empty to analyze all repos.
+
+```{r}
+# Define which repo_group_ids to include in the analysis
+# Examples: 
+#   selected_repo_groups <- c(100, 200, 300)  # Specific groups
+#   selected_repo_groups <- c()                # All groups (no filter)
+
+selected_repo_groups <- c(100, 200, 300)  # Change this to filter by specific repo groups
+
+# Create SQL filter string
+if (length(selected_repo_groups) > 0) {
+  repo_groups_sql <- paste(selected_repo_groups, collapse = ", ")
+  cat("Analyzing repo groups:", repo_groups_sql, "\n")
+} else {
+  repo_groups_sql <- NULL
+  cat("Analyzing all repo groups\n")
+}
+```
+
+This is the current list that we're interested in: Issues: time to first response time to close closure ratio Window is 60 days (for example, September 2025 â†’ Look at all the issues opened in August and July, and identify the percentage that are still open from that set at the end of September.) num of issues
+
+PRs: time to first response time to close closure ratio Window is 60 days (for example, September 2025 â†’ Look at all the PRs opened in August and July, and identify the percentage that are still open from that set at the end of September.) num of PRs
+
+Community/contributors: num of contributors To be a contributor, you have to make 4 contributions Number of people contributing anything to a project in a given month. Num of new contributors If a person has contributed in the last two years, they are not a new contributor
+
+Knowledge production: num of commits
+
+## Configuration: Collection Status Requirements
+
+Configure which collection statuses are required for different metric types.
+
+**Data Collection Phases:** - **Core**: Basic repo info, issues, PRs (augur_data.issues, augur_data.pull_requests) - **Secondary**: Messages, events, detailed metadata (augur_data.message, augur_data.issue_events, augur_data.pull_request_events) - **Facade**: Commit data (augur_data.commits)
+
+**Note**: To apply these filters to queries, replace the old hardcoded WHERE clauses:
+
+```         
+WHERE cs.core_status = 'Success'
+  AND cs.secondary_status = 'Success'
+  AND cs.facade_status = 'Success'
+```
+
+with the dynamic filter:
+
+```         
+WHERE ", collection_filters$<metric_type>, "
+```
+
+where `<metric_type>` is one of: issues, prs, contributors, commits
+
+```{r}
+# ====================
+# COLLECTION STATUS CONFIGURATION
+# ====================
+# Set which collection phases must be 'Success' for each metric type
+# TRUE = require Success, FALSE = include repos even if status is not Success
+#
+# Data Sources:
+# - Core: issues, pull_requests, issue_labels, pr_labels, issue_assignees, etc.
+# - Secondary: messages (comments), issue_events, pull_request_events, pr_reviews, pr_files, pr_commits
+# - Facade: commits (from git clone)
+#
+# Metric Requirements:
+# - Time to close: Core only (closed_at timestamp is in issues/PRs tables)
+# - Closure ratio: Core only (state/closed_at in issues/PRs tables)
+# - Number of issues/PRs: Core only
+# - Time to first response: Core + Secondary (needs messages/events for response time)
+# - Contributors (from issues/PRs/comments): Core + Secondary
+# - Contributors (including commits): Core + Secondary + Facade
+# - Commits: Facade only
+
+config_collection_requirements <- list(
+  # Issues/PRs basic metrics (count, time to close, closure ratio) - Core only
+  issues_basic = list(core = TRUE, secondary = FALSE, facade = FALSE),
+  prs_basic = list(core = TRUE, secondary = FALSE, facade = FALSE),
+  
+  # Issues/PRs response metrics (time to first response) - Core + Secondary
+  issues_response = list(core = TRUE, secondary = TRUE, facade = FALSE),
+  prs_response = list(core = TRUE, secondary = TRUE, facade = FALSE),
+  
+  # Contributors from issues/PRs/comments only - Core only (no secondary needed)
+  contributors_core = list(core = TRUE, secondary = FALSE, facade = FALSE),
+  
+  # Contributors from issues/PRs/comments with secondary data - Core + Secondary
+  contributors_no_commits = list(core = TRUE, secondary = TRUE, facade = FALSE),
+  
+  # Contributors including commits - Core + Secondary + Facade
+  contributors_with_commits = list(core = TRUE, secondary = TRUE, facade = TRUE),
+  
+  # Commits metrics - Facade only
+  commits = list(core = FALSE, secondary = FALSE, facade = TRUE),
+  
+  # Legacy aliases for backward compatibility
+  issues = list(core = TRUE, secondary = TRUE, facade = FALSE),
+  prs = list(core = TRUE, secondary = TRUE, facade = FALSE),
+  contributors = list(core = TRUE, secondary = TRUE, facade = TRUE),
+  
+  # All three (for reference/backward compatibility)
+  all_success = list(core = TRUE, secondary = TRUE, facade = TRUE)
+)
+
+# Display configuration
+cat("\n=== Collection Status Requirements ===\n")
+for (metric_type in names(config_collection_requirements)) {
+  req <- config_collection_requirements[[metric_type]]
+  cat(sprintf("%s: Core=%s, Secondary=%s, Facade=%s\n", 
+              metric_type, req$core, req$secondary, req$facade))
+}
+```
+
+## Create Repository Filter Lists
+
+Generate SQL filter conditions for each metric type based on collection requirements:
+
+```{r}
+# Function to build collection status filter
+build_status_filter <- function(requirements) {
+  filters <- c()
+  if (requirements$core) filters <- c(filters, "cs.core_status = 'Success'")
+  if (requirements$secondary) filters <- c(filters, "cs.secondary_status = 'Success'")
+  if (requirements$facade) filters <- c(filters, "cs.facade_status = 'Success'")
+  
+  if (length(filters) == 0) {
+    return("1=1")  # No requirements, include all
+  } else {
+    return(paste(filters, collapse = "\n    AND "))
+  }
+}
+
+# Create filter strings for each metric type
+collection_filters <- list()
+for (metric_type in names(config_collection_requirements)) {
+  collection_filters[[metric_type]] <- build_status_filter(config_collection_requirements[[metric_type]])
+}
+
+# Display the SQL filters
+cat("\n=== Generated SQL Filters ===\n")
+for (metric_type in names(collection_filters)) {
+  cat(sprintf("\n%s:\n  %s\n", metric_type, collection_filters[[metric_type]]))
+}
+```
+
+## Retrieve Repository Lists by Collection Status
+
+Get lists of repositories for each metric type:
+
+```{r}
+# Function to get repos with specific collection requirements
+get_repos_by_status <- function(status_filter, repo_group_filter = NULL, label = "") {
+  query <- paste0("
+    SELECT r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name as repo_group_name,
+           cs.core_status, cs.secondary_status, cs.facade_status
+    FROM augur_data.repo r
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = r.repo_id
+    LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+    WHERE ", status_filter,
+    if (!is.null(repo_group_filter)) paste0("\n      AND r.repo_group_id IN (", repo_group_filter, ")") else "",
+    "\n    ORDER BY rg.rg_name, r.repo_git;"
+  )
+  
+  repos <- dbGetQuery(con, query)
+  cat(sprintf("%s: %d repositories\n", label, nrow(repos)))
+  return(repos)
+}
+
+# Get repository lists for each metric type
+repos_by_metric <- list()
+
+cat("\n=== Repository Counts by Metric Type ===\n")
+for (metric_type in names(config_collection_requirements)) {
+  repos_by_metric[[metric_type]] <- get_repos_by_status(
+    collection_filters[[metric_type]], 
+    repo_groups_sql,
+    label = metric_type
+  )
+}
+
+# Create a summary comparison
+cat("\n=== Summary ===\n")
+cat(sprintf("All success (Core+Secondary+Facade): %d repos\n", nrow(repos_by_metric$all_success)))
+cat(sprintf("Issues metrics (Core+Secondary): %d repos\n", nrow(repos_by_metric$issues)))
+cat(sprintf("PRs metrics (Core+Secondary): %d repos\n", nrow(repos_by_metric$prs)))
+cat(sprintf("Contributors metrics (Core+Secondary+Facade): %d repos\n", nrow(repos_by_metric$contributors)))
+cat(sprintf("Commits metrics (Facade only): %d repos\n", nrow(repos_by_metric$commits)))
+
+# Keep backward compatibility - successful_repos is same as all_success
+successful_repos <- repos_by_metric$all_success
+successful_repos
+```
+
+## Issues Metrics
+
+### Time to First Response (Issues) - Monthly Summary
+
+This calculates comprehensive statistics (min, Q1, median, Q3, max, mean) for time (in hours) from issue creation to the first comment or event, calculated within each month:
+
+```{r}
+query_issues_first_response <- paste0("
+  WITH first_response AS (
+    SELECT 
+      i.repo_id,
+      i.issue_id,
+      DATE_TRUNC('month', i.created_at)::date as month,
+      i.created_at as issue_created,
+      i.reporter_id as issue_creator_id,
+      LEAST(
+        COALESCE(MIN(m.msg_timestamp) FILTER (WHERE m.msg_timestamp > i.created_at AND m.cntrb_id != i.reporter_id), '9999-12-31'::timestamp),
+        COALESCE(MIN(ie.created_at) FILTER (WHERE ie.created_at > i.created_at AND ie.cntrb_id != i.reporter_id), '9999-12-31'::timestamp)
+      ) as first_response_time
+    FROM augur_data.issues i
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    INNER JOIN augur_data.repo r ON i.repo_id = r.repo_id
+    LEFT JOIN augur_data.issue_message_ref imr ON i.issue_id = imr.issue_id
+    LEFT JOIN augur_data.message m ON imr.msg_id = m.msg_id
+    LEFT JOIN augur_data.issue_events ie ON i.issue_id = ie.issue_id
+    WHERE ", collection_filters$issues_response, "
+      AND i.pull_request IS NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n      AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+    GROUP BY i.repo_id, i.issue_id, i.created_at, i.reporter_id
+  )
+    SELECT 
+      r.repo_id,
+      r.repo_git,
+      r.repo_name,
+      r.repo_group_id,
+      rg.rg_name as repo_group_name,
+      fr.month,
+      COUNT(fr.issue_id) AS total_issues,
+      COUNT(fr.issue_id) FILTER (WHERE fr.first_response_time < '9999-12-31'::timestamp) AS issues_with_response,
+      COUNT(fr.issue_id) FILTER (WHERE fr.first_response_time >= '9999-12-31'::timestamp) AS issues_no_response,
+      ROUND(MIN(EXTRACT(EPOCH FROM (fr.first_response_time - fr.issue_created)) / 3600) FILTER (WHERE fr.first_response_time < '9999-12-31')::numeric, 2) as min_hours,
+      ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (fr.first_response_time - fr.issue_created)) / 3600) FILTER (WHERE fr.first_response_time < '9999-12-31')::numeric, 2) as q1_hours,
+      ROUND(PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (fr.first_response_time - fr.issue_created)) / 3600) FILTER (WHERE fr.first_response_time < '9999-12-31')::numeric, 2) as median_hours,
+      ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (fr.first_response_time - fr.issue_created)) / 3600) FILTER (WHERE fr.first_response_time < '9999-12-31')::numeric, 2) as q3_hours,
+      ROUND(MAX(EXTRACT(EPOCH FROM (fr.first_response_time - fr.issue_created)) / 3600) FILTER (WHERE fr.first_response_time < '9999-12-31')::numeric, 2) as max_hours,
+      ROUND(AVG(EXTRACT(EPOCH FROM (fr.first_response_time - fr.issue_created)) / 3600) FILTER (WHERE fr.first_response_time < '9999-12-31')::numeric, 2) as mean_hours
+    FROM first_response fr
+    JOIN augur_data.repo r ON fr.repo_id = r.repo_id
+    LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+    GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, fr.month
+    ORDER BY rg.rg_name, r.repo_git, fr.month DESC;
+  ")
+
+issues_time_to_first_response_summary <- dbGetQuery(con, query_issues_first_response)
+issues_time_to_first_response_summary
+```
+
+### Time to First Response (Issues) - Raw Data
+
+Individual issue-level data for detailed analysis and visualization:
+
+```{r}
+query_issues_first_response_raw <- paste0("
+  WITH first_response AS (
+    SELECT 
+      i.repo_id,
+      i.issue_id,
+      i.gh_issue_number,
+      i.created_at as issue_created,
+      DATE_TRUNC('month', i.created_at)::date as month,
+      i.reporter_id as issue_creator_id,
+      LEAST(
+        COALESCE(MIN(m.msg_timestamp) FILTER (WHERE m.msg_timestamp > i.created_at AND m.cntrb_id != i.reporter_id), '9999-12-31'::timestamp),
+        COALESCE(MIN(ie.created_at) FILTER (WHERE ie.created_at > i.created_at AND ie.cntrb_id != i.reporter_id), '9999-12-31'::timestamp)
+      ) as first_response_time
+    FROM augur_data.issues i
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    INNER JOIN augur_data.repo r ON i.repo_id = r.repo_id
+    LEFT JOIN augur_data.issue_message_ref imr ON i.issue_id = imr.issue_id
+    LEFT JOIN augur_data.message m ON imr.msg_id = m.msg_id
+    LEFT JOIN augur_data.issue_events ie ON i.issue_id = ie.issue_id
+    WHERE ", collection_filters$issues_response, "
+      AND i.pull_request IS NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n      AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+    GROUP BY i.repo_id, i.issue_id, i.gh_issue_number, i.created_at, i.reporter_id
+  )
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    fr.month,
+    fr.issue_id,
+    fr.gh_issue_number,
+    fr.issue_created,
+    fr.first_response_time,
+    ROUND(EXTRACT(EPOCH FROM (fr.first_response_time - fr.issue_created)) / 3600::numeric, 2) as hours_to_first_response
+  FROM first_response fr
+  JOIN augur_data.repo r ON fr.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  WHERE fr.first_response_time < '9999-12-31'::timestamp
+  ORDER BY rg.rg_name, r.repo_git, fr.month DESC, fr.issue_created;
+")
+
+issues_time_to_first_response_raw <- dbGetQuery(con, query_issues_first_response_raw)
+issues_time_to_first_response_raw
+```
+
+### Time to Close (Issues) - Monthly Summary
+
+This only requires Core data (closed_at timestamp is in the issues table).
+
+```{r}
+query_issues_close <- paste0("
+  SELECT 
+    i.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', i.created_at)::date as month,
+    COUNT(i.issue_id) as closed_issues,
+    ROUND(MIN(EXTRACT(EPOCH FROM (i.closed_at - i.created_at)) / 3600)::numeric, 2) as min_hours,
+    ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (i.closed_at - i.created_at)) / 3600)::numeric, 2) as q1_hours,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (i.closed_at - i.created_at)) / 3600)::numeric, 2) as median_hours,
+    ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (i.closed_at - i.created_at)) / 3600)::numeric, 2) as q3_hours,
+    ROUND(MAX(EXTRACT(EPOCH FROM (i.closed_at - i.created_at)) / 3600)::numeric, 2) as max_hours,
+    ROUND(AVG(EXTRACT(EPOCH FROM (i.closed_at - i.created_at)) / 3600)::numeric, 2) as mean_hours
+  FROM augur_data.issues i
+  JOIN augur_data.repo r ON i.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+  WHERE ", collection_filters$issues_basic, "
+    AND i.pull_request IS NULL
+    AND i.closed_at IS NOT NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY i.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', i.created_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+issues_time_to_close_summary <- dbGetQuery(con, query_issues_close)
+issues_time_to_close_summary
+```
+
+### Time to Close (Issues) - Raw Data
+
+This only requires Core data.
+
+```{r}
+query_issues_close_raw <- paste0("
+  SELECT 
+    i.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', i.created_at)::date as month,
+    i.issue_id,
+    i.gh_issue_number,
+    i.created_at,
+    i.closed_at,
+    ROUND(EXTRACT(EPOCH FROM (i.closed_at - i.created_at)) / 3600::numeric, 2) as hours_to_close
+  FROM augur_data.issues i
+  JOIN augur_data.repo r ON i.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+  WHERE ", collection_filters$issues_basic, "
+    AND i.pull_request IS NULL
+    AND i.closed_at IS NOT NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  ORDER BY rg.rg_name, r.repo_git, month DESC, i.created_at;
+")
+
+issues_time_to_close_raw <- dbGetQuery(con, query_issues_close_raw)
+issues_time_to_close_raw
+```
+
+### Closure Ratio with 60-Day Window (Issues)
+
+For each month, this looks at issues opened in the previous 60 days and calculates what percentage are still open. This only requires Core data (issue state and timestamps).
+
+```{r}
+query_issues_closure <- paste0("
+  WITH monthly_periods AS (
+    SELECT 
+      DATE_TRUNC('month', d)::date as month_end,
+      (DATE_TRUNC('month', d) - INTERVAL '60 days')::date as window_start,
+      (DATE_TRUNC('month', d) - INTERVAL '1 day')::date as window_end
+    FROM generate_series(
+      (SELECT MIN(created_at) FROM augur_data.issues) + INTERVAL '60 days',
+      CURRENT_DATE,
+      '1 month'::interval
+    ) d
+  ),
+  issue_status AS (
+    SELECT 
+      i.repo_id,
+      r.repo_git,
+      r.repo_name,
+      r.repo_group_id,
+      rg.rg_name as repo_group_name,
+      mp.month_end,
+      i.issue_id,
+      i.created_at,
+      i.closed_at,
+      CASE 
+        WHEN i.closed_at IS NULL OR i.closed_at > mp.month_end THEN 1
+        ELSE 0
+      END as still_open
+    FROM augur_data.issues i
+    JOIN augur_data.repo r ON i.repo_id = r.repo_id
+    LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    CROSS JOIN monthly_periods mp
+    WHERE ", collection_filters$issues_basic, "
+      AND i.pull_request IS NULL
+      AND i.created_at::date BETWEEN mp.window_start AND mp.window_end",
+  if (!is.null(repo_groups_sql)) paste0("\n      AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  )
+  SELECT 
+    repo_id,
+    repo_git,
+    repo_name,
+    repo_group_id,
+    repo_group_name,
+    month_end,
+    COUNT(issue_id) as issues_in_window,
+    SUM(still_open) as still_open,
+    ROUND((SUM(still_open)::numeric / COUNT(issue_id) * 100), 2) as pct_still_open,
+    ROUND(((COUNT(issue_id) - SUM(still_open))::numeric / COUNT(issue_id) * 100), 2) as closure_ratio_pct
+  FROM issue_status
+  GROUP BY repo_id, repo_git, repo_name, repo_group_id, repo_group_name, month_end
+  HAVING COUNT(issue_id) > 0
+  ORDER BY repo_group_name, repo_git, month_end DESC;
+")
+
+issues_closure_ratio <- dbGetQuery(con, query_issues_closure)
+issues_closure_ratio
+```
+
+Then, create a histogram of the closure ratio distribution and also had the average closure rate for each repo_group_id (fill=repo_group_id).
+
+```{r}
+
+# histogram of closure ratios, using repo_group_name as grouping variable in ggplot and also each repo_group_id gets its own scale
+library(ggplot2)
+library(dplyr)
+closure_ratio_histogram <- ggplot(data = issues_closure_ratio %>% mutate(repo_group_id = as.factor(repo_group_id)),
+                                  aes(x = closure_ratio_pct,
+                                      fill = repo_group_id)) +
+  geom_histogram(position = position_dodge()) +
+  facet_wrap(~ repo_group_id, scales = "free_y") + 
+  labs(title = "Histogram of Issue Closure Ratios by Repo Group",
+       x = "Closure Ratio (%)",
+       y = "Count") +
+  # add bars for average values
+  geom_vline(data = issues_closure_ratio %>%
+               group_by(repo_group_id) %>%
+               summarize(mean_closure_ratio = mean(closure_ratio_pct, na.rm = TRUE)),
+             aes(xintercept = mean_closure_ratio),
+             color = "red", linetype = "dashed", linewidth = 1)
+
+closure_ratio_histogram
+
+
+# create the same thing but now using a density plot
+density_plot <- ggplot(data = issues_closure_ratio %>% mutate(repo_group_id = as.factor(repo_group_id)),
+                                  aes(x = closure_ratio_pct,
+                                      fill = repo_group_id)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~ repo_group_id, scales = "free_y") + 
+  labs(title = "Density Plot of Issue Closure Ratios by Repo Group",
+       x = "Closure Ratio (%)",
+       y = "Density") +
+  # add lines for average values
+  geom_vline(data = issues_closure_ratio %>%
+               group_by(repo_group_id) %>%
+               summarize(mean_closure_ratio = mean(closure_ratio_pct, na.rm = TRUE)),
+             aes(xintercept = mean_closure_ratio),
+             color = "red", linetype = "dashed", linewidth = 1)
+
+density_plot
+
+```
+
+### Closure Ratio (Issues) - Summary by Repository
+
+This aggregates the monthly closure ratios by repository and provides a 6-point summary. Core data only.
+
+```{r}
+query_issues_closure_summary <- paste0("
+  WITH monthly_periods AS (
+    SELECT 
+      DATE_TRUNC('month', d)::date as month_end,
+      (DATE_TRUNC('month', d) - INTERVAL '60 days')::date as window_start,
+      (DATE_TRUNC('month', d) - INTERVAL '1 day')::date as window_end
+    FROM generate_series(
+      (SELECT MIN(created_at) FROM augur_data.issues) + INTERVAL '60 days',
+      CURRENT_DATE,
+      '1 month'::interval
+    ) d
+  ),
+  issue_status AS (
+    SELECT 
+      i.repo_id,
+      r.repo_git,
+      r.repo_name,
+      r.repo_group_id,
+      rg.rg_name as repo_group_name,
+      mp.month_end,
+      i.issue_id,
+      i.created_at,
+      i.closed_at,
+      CASE 
+        WHEN i.closed_at IS NULL OR i.closed_at > mp.month_end THEN 1
+        ELSE 0
+      END as still_open
+    FROM augur_data.issues i
+    JOIN augur_data.repo r ON i.repo_id = r.repo_id
+    LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    CROSS JOIN monthly_periods mp
+    WHERE ", collection_filters$issues_basic, "
+      AND i.pull_request IS NULL
+      AND i.created_at::date BETWEEN mp.window_start AND mp.window_end",
+  if (!is.null(repo_groups_sql)) paste0("\n      AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  ),
+  monthly_closure_ratios AS (
+    SELECT 
+      repo_id,
+      repo_git,
+      repo_name,
+      repo_group_id,
+      repo_group_name,
+      month_end,
+      ROUND(((COUNT(issue_id) - SUM(still_open))::numeric / COUNT(issue_id) * 100), 2) as closure_ratio_pct
+    FROM issue_status
+    GROUP BY repo_id, repo_git, repo_name, repo_group_id, repo_group_name, month_end
+    HAVING COUNT(issue_id) > 0
+  )
+  SELECT 
+    repo_id,
+    repo_git,
+    repo_name,
+    repo_group_id,
+    repo_group_name,
+    COUNT(month_end) as num_months,
+    ROUND(MIN(closure_ratio_pct)::numeric, 2) as min_closure_ratio_pct,
+    ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY closure_ratio_pct)::numeric, 2) as q1_closure_ratio_pct,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY closure_ratio_pct)::numeric, 2) as median_closure_ratio_pct,
+    ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY closure_ratio_pct)::numeric, 2) as q3_closure_ratio_pct,
+    ROUND(MAX(closure_ratio_pct)::numeric, 2) as max_closure_ratio_pct,
+    ROUND(AVG(closure_ratio_pct)::numeric, 2) as mean_closure_ratio_pct
+  FROM monthly_closure_ratios
+  GROUP BY repo_id, repo_git, repo_name, repo_group_id, repo_group_name
+  ORDER BY repo_group_name, repo_git;
+")
+
+issues_closure_ratio_summary <- dbGetQuery(con, query_issues_closure_summary)
+issues_closure_ratio_summary
+```
+
+```{r}
+# using the issues_closure_ratio data, create a histogram of closure ratios using the repo_group_name as grouping variable in ggplot
+
+library(ggplot2)
+library(dplyr)
+# build a histogram using repo_group_name as group
+closure_ratio_histogram <- ggplot(data = issues_closure_ratio %>% mutate(repo_group_id = as.factor(repo_group_id)),
+                                  aes(x = closure_ratio_pct,
+                                      fill = repo_group_id)) +
+  geom_histogram(position = position_dodge())
+
+closure_ratio_histogram
+```
+
+### Number of Issues (Monthly)
+
+This only requires Core data.
+
+```{r}
+query_issues_count <- paste0("
+  SELECT 
+    i.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', i.created_at)::date as month,
+    COUNT(i.issue_id) as num_issues
+  FROM augur_data.issues i
+  JOIN augur_data.repo r ON i.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    WHERE ", collection_filters$issues_basic, "
+    AND i.pull_request IS NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY i.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', i.created_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+issues_count_monthly <- dbGetQuery(con, query_issues_count)
+issues_count_monthly
+```
+
+## PRs Metrics
+
+### Time to First Response (PRs) - Monthly Summary
+
+This requires Core + Secondary data (messages/events for first response detection).
+
+```{r}
+query_prs_first_response <- paste0("
+  WITH first_response AS (
+    SELECT 
+      pr.repo_id,
+      pr.pull_request_id,
+      DATE_TRUNC('month', pr.pr_created_at)::date as month,
+      pr.pr_created_at as pr_created,
+      pr.pr_augur_contributor_id as pr_creator_id,
+      LEAST(
+        COALESCE(MIN(m.msg_timestamp) FILTER (WHERE m.msg_timestamp > pr.pr_created_at AND m.cntrb_id != pr.pr_augur_contributor_id), '9999-12-31'::timestamp),
+        COALESCE(MIN(pre.created_at) FILTER (WHERE pre.created_at > pr.pr_created_at AND pre.cntrb_id != pr.pr_augur_contributor_id), '9999-12-31'::timestamp)
+      ) as first_response_time
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    INNER JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+    LEFT JOIN augur_data.pull_request_message_ref pmr ON pr.pull_request_id = pmr.pull_request_id
+    LEFT JOIN augur_data.message m ON pmr.msg_id = m.msg_id
+    LEFT JOIN augur_data.pull_request_events pre ON pr.pull_request_id = pre.pull_request_id
+    WHERE ", collection_filters$prs_response, "",
+  if (!is.null(repo_groups_sql)) paste0("\n      AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+    GROUP BY pr.repo_id, pr.pull_request_id, pr.pr_created_at, pr.pr_augur_contributor_id
+  )
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    fr.month,
+    COUNT(fr.pull_request_id) AS total_prs,
+    COUNT(*) FILTER (WHERE fr.first_response_time < '9999-12-31'::timestamp) AS prs_with_response,
+    COUNT(*) FILTER (WHERE fr.first_response_time >= '9999-12-31'::timestamp) AS prs_no_response,
+    ROUND(MIN(EXTRACT(EPOCH FROM (fr.first_response_time - fr.pr_created)) / 3600) 
+          FILTER (WHERE fr.first_response_time < '9999-12-31'::timestamp)::numeric, 2) as min_hours,
+    ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (fr.first_response_time - fr.pr_created)) / 3600)
+          FILTER (WHERE fr.first_response_time < '9999-12-31'::timestamp)::numeric, 2) as q1_hours,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (fr.first_response_time - fr.pr_created)) / 3600)
+          FILTER (WHERE fr.first_response_time < '9999-12-31'::timestamp)::numeric, 2) as median_hours,
+    ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (fr.first_response_time - fr.pr_created)) / 3600)
+          FILTER (WHERE fr.first_response_time < '9999-12-31'::timestamp)::numeric, 2) as q3_hours,
+    ROUND(MAX(EXTRACT(EPOCH FROM (fr.first_response_time - fr.pr_created)) / 3600)
+          FILTER (WHERE fr.first_response_time < '9999-12-31'::timestamp)::numeric, 2) as max_hours,
+    ROUND(AVG(EXTRACT(EPOCH FROM (fr.first_response_time - fr.pr_created)) / 3600)
+          FILTER (WHERE fr.first_response_time < '9999-12-31'::timestamp)::numeric, 2) as mean_hours
+  FROM first_response fr
+  JOIN augur_data.repo r ON fr.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, fr.month
+  ORDER BY rg.rg_name, r.repo_git, fr.month DESC;
+")
+
+prs_time_to_first_response_summary <- dbGetQuery(con, query_prs_first_response)
+prs_time_to_first_response_summary
+```
+
+### Time to First Response (PRs) - Raw Data
+
+This requires Core + Secondary data.
+
+```{r}
+query_prs_first_response_raw <- paste0("
+  WITH first_response AS (
+    SELECT 
+      pr.repo_id,
+      pr.pull_request_id,
+      pr.pr_src_number,
+      pr.pr_created_at as pr_created,
+      DATE_TRUNC('month', pr.pr_created_at)::date as month,
+      pr.pr_augur_contributor_id as pr_creator_id,
+      LEAST(
+        COALESCE(MIN(m.msg_timestamp) FILTER (WHERE m.msg_timestamp > pr.pr_created_at AND m.cntrb_id != pr.pr_augur_contributor_id), '9999-12-31'::timestamp),
+        COALESCE(MIN(pre.created_at) FILTER (WHERE pre.created_at > pr.pr_created_at AND pre.cntrb_id != pr.pr_augur_contributor_id), '9999-12-31'::timestamp)
+      ) as first_response_time
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    INNER JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+    LEFT JOIN augur_data.pull_request_message_ref pmr ON pr.pull_request_id = pmr.pull_request_id
+    LEFT JOIN augur_data.message m ON pmr.msg_id = m.msg_id
+    LEFT JOIN augur_data.pull_request_events pre ON pr.pull_request_id = pre.pull_request_id
+    WHERE ", collection_filters$prs_response, "",
+  if (!is.null(repo_groups_sql)) paste0("\n      AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+    GROUP BY pr.repo_id, pr.pull_request_id, pr.pr_src_number, pr.pr_created_at, pr.pr_augur_contributor_id
+  )
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    fr.month,
+    fr.pull_request_id,
+    fr.pr_src_number,
+    fr.pr_created,
+    fr.first_response_time,
+    CASE 
+      WHEN fr.first_response_time < '9999-12-31'::timestamp 
+        THEN ROUND(EXTRACT(EPOCH FROM (fr.first_response_time - fr.pr_created)) / 3600::numeric, 2)
+      ELSE NULL
+    END as hours_to_first_response,
+    (fr.first_response_time < '9999-12-31'::timestamp) AS responded
+  FROM first_response fr
+  JOIN augur_data.repo r ON fr.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  WHERE 1=1
+  ORDER BY rg.rg_name, r.repo_git, fr.month DESC, fr.pr_created;
+")
+
+prs_time_to_first_response_raw <- dbGetQuery(con, query_prs_first_response_raw)
+prs_time_to_first_response_raw
+```
+
+### Time to Close (PRs) - Monthly Summary
+
+This only requires Core data (pr_closed_at is in the pull_requests table).
+
+```{r}
+query_prs_time_to_close <- paste0("
+  SELECT 
+    pr.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', pr.pr_created_at)::date as month,
+    COUNT(pr.pull_request_id) as closed_prs,
+    ROUND(MIN(EXTRACT(EPOCH FROM (pr.pr_closed_at - pr.pr_created_at)) / 3600)::numeric, 2) as min_hours,
+    ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (pr.pr_closed_at - pr.pr_created_at)) / 3600)::numeric, 2) as q1_hours,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (pr.pr_closed_at - pr.pr_created_at)) / 3600)::numeric, 2) as median_hours,
+    ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (pr.pr_closed_at - pr.pr_created_at)) / 3600)::numeric, 2) as q3_hours,
+    ROUND(MAX(EXTRACT(EPOCH FROM (pr.pr_closed_at - pr.pr_created_at)) / 3600)::numeric, 2) as max_hours,
+    ROUND(AVG(EXTRACT(EPOCH FROM (pr.pr_closed_at - pr.pr_created_at)) / 3600)::numeric, 2) as mean_hours
+  FROM augur_data.pull_requests pr
+  JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$prs_basic, "
+    AND pr.pr_closed_at IS NOT NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY pr.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', pr.pr_created_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+prs_time_to_close_summary <- dbGetQuery(con, query_prs_time_to_close)
+prs_time_to_close_summary
+```
+
+### Time to Close (PRs) - Raw Data
+
+This only requires Core data.
+
+```{r}
+query_prs_time_to_close_raw <- paste0("
+  SELECT 
+    pr.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', pr.pr_created_at)::date as month,
+    pr.pull_request_id,
+    pr.pr_src_number,
+    pr.pr_created_at,
+    pr.pr_closed_at,
+    ROUND(EXTRACT(EPOCH FROM (pr.pr_closed_at - pr.pr_created_at)) / 3600::numeric, 2) as hours_to_close
+  FROM augur_data.pull_requests pr
+  JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$prs_basic, "
+    AND pr.pr_closed_at IS NOT NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  ORDER BY rg.rg_name, r.repo_git, month DESC, pr.pr_created_at;
+")
+
+prs_time_to_close_raw <- dbGetQuery(con, query_prs_time_to_close_raw)
+prs_time_to_close_raw
+```
+
+### PR Acceptance Rate (Merged / Closed) - Monthly
+
+```{r}
+query_prs_acceptance <- paste0("
+  WITH prs AS (
+    SELECT
+      pr.repo_id,
+      DATE_TRUNC('month', pr.pr_created_at)::date AS month,
+      pr.pr_closed_at IS NOT NULL AS is_closed,
+      pr.pr_merged_at IS NOT NULL AS is_merged
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    INNER JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+    WHERE ", collection_filters$prs_basic, "",
+  if (!is.null(repo_groups_sql)) paste0("\n      AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  )
+  SELECT
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name AS repo_group_name,
+    prs.month,
+    COUNT(*) FILTER (WHERE is_closed) AS closed_prs,
+    COUNT(*) FILTER (WHERE is_closed AND is_merged) AS merged_prs,
+    ROUND(
+      CASE WHEN COUNT(*) FILTER (WHERE is_closed) = 0 THEN 0
+           ELSE (COUNT(*) FILTER (WHERE is_closed AND is_merged))::numeric
+                / COUNT(*) FILTER (WHERE is_closed)
+      END, 4
+    ) AS acceptance_rate
+  FROM prs
+  JOIN augur_data.repo r ON r.repo_id = prs.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, prs.month
+  ORDER BY rg.rg_name, r.repo_git, prs.month DESC;
+")
+
+prs_acceptance_monthly <- dbGetQuery(con, query_prs_acceptance)
+prs_acceptance_monthly
+```
+
+### Closure Ratio with 60-Day Window (PRs)
+
+This only requires Core data.
+
+```{r}
+query_prs_closure_ratio <- paste0("
+  WITH monthly_periods AS (
+    SELECT 
+      DATE_TRUNC('month', d)::date as month_end,
+      (DATE_TRUNC('month', d) - INTERVAL '60 days')::date as window_start,
+      (DATE_TRUNC('month', d) - INTERVAL '1 day')::date as window_end
+    FROM generate_series(
+      (SELECT MIN(pr_created_at) FROM augur_data.pull_requests) + INTERVAL '60 days',
+      CURRENT_DATE,
+      '1 month'::interval
+    ) d
+  ),
+  pr_status AS (
+    SELECT 
+      pr.repo_id,
+      r.repo_git,
+      r.repo_name,
+      r.repo_group_id,
+      rg.rg_name as repo_group_name,
+      mp.month_end,
+      pr.pull_request_id,
+      pr.pr_created_at,
+      pr.pr_closed_at,
+      CASE 
+        WHEN pr.pr_closed_at IS NULL OR pr.pr_closed_at > mp.month_end THEN 1
+        ELSE 0
+      END as still_open
+    FROM augur_data.pull_requests pr
+    JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+    LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    CROSS JOIN monthly_periods mp
+    WHERE ", collection_filters$prs_basic, "",
+  if (!is.null(repo_groups_sql)) paste0("\n      AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+      AND pr.pr_created_at::date BETWEEN mp.window_start AND mp.window_end
+  )
+  SELECT 
+    repo_id,
+    repo_git,
+    repo_name,
+    repo_group_id,
+    repo_group_name,
+    month_end,
+    COUNT(pull_request_id) as prs_in_window,
+    SUM(still_open) as still_open,
+    ROUND((SUM(still_open)::numeric / COUNT(pull_request_id) * 100), 2) as pct_still_open,
+    ROUND(((COUNT(pull_request_id) - SUM(still_open))::numeric / COUNT(pull_request_id) * 100), 2) as closure_ratio_pct
+  FROM pr_status
+  GROUP BY repo_id, repo_git, repo_name, repo_group_id, repo_group_name, month_end
+  HAVING COUNT(pull_request_id) > 0
+  ORDER BY repo_group_name, repo_git, month_end DESC;
+")
+
+prs_closure_ratio <- dbGetQuery(con, query_prs_closure_ratio)
+prs_closure_ratio
+```
+
+### Closure Ratio (PRs) - Summary by Repository
+
+This aggregates the monthly closure ratios by repository and provides a 6-point summary. Core data only.
+
+```{r}
+query_prs_closure_ratio_summary <- paste0("
+  WITH monthly_periods AS (
+    SELECT 
+      DATE_TRUNC('month', d)::date as month_end,
+      (DATE_TRUNC('month', d) - INTERVAL '60 days')::date as window_start,
+      (DATE_TRUNC('month', d) - INTERVAL '1 day')::date as window_end
+    FROM generate_series(
+      (SELECT MIN(pr_created_at) FROM augur_data.pull_requests) + INTERVAL '60 days',
+      CURRENT_DATE,
+      '1 month'::interval
+    ) d
+  ),
+  pr_status AS (
+    SELECT 
+      pr.repo_id,
+      r.repo_git,
+      r.repo_name,
+      r.repo_group_id,
+      rg.rg_name as repo_group_name,
+      mp.month_end,
+      pr.pull_request_id,
+      pr.pr_created_at,
+      pr.pr_closed_at,
+      CASE 
+        WHEN pr.pr_closed_at IS NULL OR pr.pr_closed_at > mp.month_end THEN 1
+        ELSE 0
+      END as still_open
+    FROM augur_data.pull_requests pr
+    JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+    LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    CROSS JOIN monthly_periods mp
+    WHERE ", collection_filters$prs_basic, "",
+  if (!is.null(repo_groups_sql)) paste0("\n      AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+      AND pr.pr_created_at::date BETWEEN mp.window_start AND mp.window_end
+  ),
+  monthly_closure_ratios AS (
+    SELECT 
+      repo_id,
+      repo_git,
+      repo_name,
+      repo_group_id,
+      repo_group_name,
+      month_end,
+      ROUND(((COUNT(pull_request_id) - SUM(still_open))::numeric / COUNT(pull_request_id) * 100), 2) as closure_ratio_pct
+    FROM pr_status
+    GROUP BY repo_id, repo_git, repo_name, repo_group_id, repo_group_name, month_end
+    HAVING COUNT(pull_request_id) > 0
+  )
+  SELECT 
+    repo_id,
+    repo_git,
+    repo_name,
+    repo_group_id,
+    repo_group_name,
+    COUNT(month_end) as num_months,
+    ROUND(MIN(closure_ratio_pct)::numeric, 2) as min_closure_ratio_pct,
+    ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY closure_ratio_pct)::numeric, 2) as q1_closure_ratio_pct,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY closure_ratio_pct)::numeric, 2) as median_closure_ratio_pct,
+    ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY closure_ratio_pct)::numeric, 2) as q3_closure_ratio_pct,
+    ROUND(MAX(closure_ratio_pct)::numeric, 2) as max_closure_ratio_pct,
+    ROUND(AVG(closure_ratio_pct)::numeric, 2) as mean_closure_ratio_pct
+  FROM monthly_closure_ratios
+  GROUP BY repo_id, repo_git, repo_name, repo_group_id, repo_group_name
+  ORDER BY repo_group_name, repo_git;
+")
+
+prs_closure_ratio_summary <- dbGetQuery(con, query_prs_closure_ratio_summary)
+prs_closure_ratio_summary
+```
+
+### Number of PRs (Monthly)
+
+This only requires Core data.
+
+```{r}
+query_prs_count <- paste0("
+  SELECT 
+    pr.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', pr.pr_created_at)::date as month,
+    COUNT(pr.pull_request_id) as num_prs
+  FROM augur_data.pull_requests pr
+  JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$prs_basic, "",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY pr.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', pr.pr_created_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+prs_count_monthly <- dbGetQuery(con, query_prs_count)
+prs_count_monthly
+```
+
+## Community/Contributors Metrics
+
+**PERFORMANCE NOTE:** These queries have been optimized for performance: 1. New contributors query uses pre-aggregated monthly activity instead of correlated subqueries 2. Team metrics query filters by collection_status to avoid processing failed repos 3. Contributor months uses GROUP BY instead of DISTINCT for better performance
+
+**RECOMMENDED INDEXES:** Ensure the following indexes exist for optimal performance:
+
+``` sql
+-- For new contributors and activity tracking
+CREATE INDEX IF NOT EXISTS idx_issues_reporter_created ON augur_data.issues(reporter_id, created_at) WHERE pull_request IS NULL;
+CREATE INDEX IF NOT EXISTS idx_prs_contributor_created ON augur_data.pull_requests(pr_augur_contributor_id, pr_created_at);
+CREATE INDEX IF NOT EXISTS idx_message_cntrb_timestamp ON augur_data.message(cntrb_id, msg_timestamp);
+
+-- For commits-based queries
+CREATE INDEX IF NOT EXISTS idx_commits_repo_date ON augur_data.commits(repo_id, cmt_committer_date);
+CREATE INDEX IF NOT EXISTS idx_commits_author_date ON augur_data.commits(cmt_ght_author_id, cmt_author_timestamp) WHERE cmt_ght_author_id IS NOT NULL;
+
+-- For collection status filtering
+CREATE INDEX IF NOT EXISTS idx_collection_status_facade ON augur_operations.collection_status(repo_id, facade_status);
+```
+
+### Number of Contributors (Monthly) - From Issues/PRs/Comments Only
+
+This version counts contributors from Core+Secondary data only (no commits). Contributors are anyone who opened an issue, opened a PR, or left a comment.
+
+```{r}
+query_contributors_count_no_commits <- paste0("
+  WITH all_contributions AS (
+    -- Issues opened
+    SELECT 
+      i.repo_id,
+      i.reporter_id as cntrb_id,
+      DATE_TRUNC('month', i.created_at)::date as month
+    FROM augur_data.issues i
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    WHERE ", collection_filters$contributors_no_commits, "
+      AND i.pull_request IS NULL
+      AND i.reporter_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- PRs opened
+    SELECT 
+      pr.repo_id,
+      pr.pr_augur_contributor_id as cntrb_id,
+      DATE_TRUNC('month', pr.pr_created_at)::date as month
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$contributors_no_commits, "
+      AND pr.pr_augur_contributor_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- Issue comments
+    SELECT 
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.issue_message_ref imr ON m.msg_id = imr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_no_commits, "
+      AND m.cntrb_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- PR comments
+    SELECT 
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.pull_request_message_ref pmr ON m.msg_id = pmr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_no_commits, "
+      AND m.cntrb_id IS NOT NULL
+  )
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    ac.month,
+    COUNT(DISTINCT ac.cntrb_id) as num_contributors
+  FROM all_contributions ac
+  JOIN augur_data.repo r ON ac.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id",
+  if (!is.null(repo_groups_sql)) paste0("\n  WHERE r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, ac.month
+  ORDER BY rg.rg_name, r.repo_git, ac.month DESC;
+")
+
+contributors_count_monthly <- dbGetQuery(con, query_contributors_count_no_commits)
+contributors_count_monthly
+```
+
+### Number of Contributors (Monthly) - Including Commits
+
+This version includes commits (requires Facade data) for repos that have it.
+
+```{r}
+query_contributors_count_with_commits <- paste0("
+  WITH all_contributions AS (
+    -- Commits (only for repos with Facade success)
+    SELECT 
+      c.repo_id,
+      c.cmt_ght_author_id as cntrb_id,
+      DATE_TRUNC('month', c.cmt_author_timestamp)::date as month
+    FROM augur_data.commits c
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = c.repo_id
+    WHERE ", collection_filters$contributors_with_commits, "
+      AND c.cmt_ght_author_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- Issues opened
+    SELECT 
+      i.repo_id,
+      i.reporter_id as cntrb_id,
+      DATE_TRUNC('month', i.created_at)::date as month
+    FROM augur_data.issues i
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    WHERE ", collection_filters$contributors_with_commits, "
+      AND i.pull_request IS NULL
+      AND i.reporter_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- PRs opened
+    SELECT 
+      pr.repo_id,
+      pr.pr_augur_contributor_id as cntrb_id,
+      DATE_TRUNC('month', pr.pr_created_at)::date as month
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$contributors_with_commits, "
+      AND pr.pr_augur_contributor_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- Issue comments
+    SELECT 
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.issue_message_ref imr ON m.msg_id = imr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_with_commits, "
+      AND m.cntrb_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- PR comments
+    SELECT 
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.pull_request_message_ref pmr ON m.msg_id = pmr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_with_commits, "
+      AND m.cntrb_id IS NOT NULL
+  )
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    ac.month,
+    COUNT(DISTINCT ac.cntrb_id) as num_contributors
+  FROM all_contributions ac
+  JOIN augur_data.repo r ON ac.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id",
+  if (!is.null(repo_groups_sql)) paste0("\n  WHERE r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, ac.month
+  ORDER BY rg.rg_name, r.repo_git, ac.month DESC;
+")
+
+contributors_count_with_commits_monthly <- dbGetQuery(con, query_contributors_count_with_commits)
+contributors_count_with_commits_monthly
+```
+
+### Core Contributors (4+ contributions per month)
+
+Contributors who have made 4 or more contributions in a given month. Uses core data only (issues, PRs, comments) - no commit data needed.
+
+```{r}
+query_core_contributors <- paste0("
+  WITH all_contributions AS (
+    -- Issues opened
+    SELECT 
+      i.repo_id,
+      i.reporter_id as cntrb_id,
+      DATE_TRUNC('month', i.created_at)::date as month
+    FROM augur_data.issues i
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND i.pull_request IS NULL
+      AND i.reporter_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- PRs opened
+    SELECT 
+      pr.repo_id,
+      pr.pr_augur_contributor_id as cntrb_id,
+      DATE_TRUNC('month', pr.pr_created_at)::date as month
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND pr.pr_augur_contributor_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- Issue comments
+    SELECT 
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.issue_message_ref imr ON m.msg_id = imr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND m.cntrb_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- PR comments
+    SELECT 
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.pull_request_message_ref pmr ON m.msg_id = pmr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND m.cntrb_id IS NOT NULL
+  ),
+  contributor_counts AS (
+    SELECT 
+      repo_id,
+      month,
+      cntrb_id,
+      COUNT(*) as num_contributions
+    FROM all_contributions
+    GROUP BY repo_id, month, cntrb_id
+  )
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    cc.month,
+    COUNT(DISTINCT cc.cntrb_id) as num_core_contributors
+  FROM contributor_counts cc
+  JOIN augur_data.repo r ON cc.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  WHERE cc.num_contributions >= 4",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, cc.month
+  ORDER BY rg.rg_name, r.repo_git, cc.month DESC;
+")
+
+core_contributors_monthly <- dbGetQuery(con, query_core_contributors)
+core_contributors_monthly
+```
+
+### New Contributors (Monthly)
+
+New contributors are those who haven't contributed to the project in the previous 2 years. Uses core data only (issues, PRs, comments) - no commit data needed.
+
+```{r}
+query_new_contributors <- paste0("
+  WITH all_contributions AS (
+    -- Issues opened
+    SELECT 
+      i.repo_id,
+      i.reporter_id as cntrb_id,
+      i.created_at as contribution_date
+    FROM augur_data.issues i
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND i.pull_request IS NULL
+      AND i.reporter_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- PRs opened
+    SELECT 
+      pr.repo_id,
+      pr.pr_augur_contributor_id as cntrb_id,
+      pr.pr_created_at as contribution_date
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND pr.pr_augur_contributor_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- Issue comments
+    SELECT 
+      m.repo_id,
+      m.cntrb_id,
+      m.msg_timestamp as contribution_date
+    FROM augur_data.message m
+    INNER JOIN augur_data.issue_message_ref imr ON m.msg_id = imr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND m.cntrb_id IS NOT NULL
+    
+    UNION ALL
+    
+    -- PR comments
+    SELECT 
+      m.repo_id,
+      m.cntrb_id,
+      m.msg_timestamp as contribution_date
+    FROM augur_data.message m
+    INNER JOIN augur_data.pull_request_message_ref pmr ON m.msg_id = pmr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND m.cntrb_id IS NOT NULL
+  ),
+  -- OPTIMIZATION: Pre-calculate first contribution date and monthly activity
+  first_contribution AS (
+    SELECT 
+      repo_id,
+      cntrb_id,
+      MIN(contribution_date) as first_contrib_date
+    FROM all_contributions
+    GROUP BY repo_id, cntrb_id
+  ),
+  contributor_months AS (
+    SELECT 
+      ac.repo_id,
+      ac.cntrb_id,
+      DATE_TRUNC('month', ac.contribution_date)::date as contrib_month,
+      fc.first_contrib_date
+    FROM all_contributions ac
+    JOIN first_contribution fc ON ac.repo_id = fc.repo_id AND ac.cntrb_id = fc.cntrb_id
+    GROUP BY ac.repo_id, ac.cntrb_id, DATE_TRUNC('month', ac.contribution_date)::date, fc.first_contrib_date
+  ),
+  -- OPTIMIZATION: Pre-calculate activity windows to avoid NOT EXISTS for each row
+  prior_activity AS (
+    SELECT DISTINCT
+      ac.repo_id,
+      ac.cntrb_id,
+      DATE_TRUNC('month', ac.contribution_date)::date as active_month
+    FROM all_contributions ac
+  ),
+  new_in_month AS (
+    SELECT 
+      cm.repo_id,
+      cm.cntrb_id,
+      cm.contrib_month,
+      CASE 
+        -- First-ever contribution this month
+        WHEN DATE_TRUNC('month', cm.first_contrib_date)::date = cm.contrib_month THEN 1
+        -- OR no activity in prior 2 years (using LEFT JOIN for better performance)
+        WHEN pa.active_month IS NULL THEN 1
+        ELSE 0
+      END as is_new
+    FROM contributor_months cm
+    LEFT JOIN prior_activity pa ON 
+      pa.repo_id = cm.repo_id 
+      AND pa.cntrb_id = cm.cntrb_id 
+      AND pa.active_month >= cm.contrib_month - INTERVAL '2 years'
+      AND pa.active_month < cm.contrib_month
+  )
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    nm.contrib_month as month,
+    SUM(nm.is_new) as num_new_contributors
+  FROM new_in_month nm
+  JOIN augur_data.repo r ON nm.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id",
+  if (!is.null(repo_groups_sql)) paste0("\n  WHERE r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, nm.contrib_month
+  HAVING SUM(nm.is_new) > 0
+  ORDER BY rg.rg_name, r.repo_git, nm.contrib_month DESC;
+")
+
+new_contributors_monthly <- dbGetQuery(con, query_new_contributors)
+new_contributors_monthly
+```
+
+### Query Performance Validation (Optional Diagnostic)
+
+Run this to check if recommended indexes exist and get performance insights:
+
+```{r eval=FALSE}
+# Check for recommended indexes
+cat("=== CHECKING RECOMMENDED INDEXES ===\n\n")
+
+index_check_queries <- list(
+  "Issues reporter index" = "SELECT schemaname, tablename, indexname FROM pg_indexes WHERE tablename = 'issues' AND indexname LIKE '%reporter%created%';",
+  "PRs contributor index" = "SELECT schemaname, tablename, indexname FROM pg_indexes WHERE tablename = 'pull_requests' AND indexname LIKE '%contributor%created%';",
+  "Message contributor index" = "SELECT schemaname, tablename, indexname FROM pg_indexes WHERE tablename = 'message' AND indexname LIKE '%cntrb%timestamp%';",
+  "Commits repo/date index" = "SELECT schemaname, tablename, indexname FROM pg_indexes WHERE tablename = 'commits' AND indexname LIKE '%repo%date%';",
+  "Collection status facade" = "SELECT schemaname, tablename, indexname FROM pg_indexes WHERE tablename = 'collection_status' AND indexname LIKE '%facade%';"
+)
+
+for (name in names(index_check_queries)) {
+  result <- dbGetQuery(con, index_check_queries[[name]])
+  if (nrow(result) > 0) {
+    cat(sprintf("âœ“ %s: FOUND\n", name))
+  } else {
+    cat(sprintf("âœ— %s: MISSING (may impact performance)\n", name))
+  }
+}
+
+cat("\n=== TABLE SIZE INFORMATION ===\n")
+table_sizes <- dbGetQuery(con, "
+  SELECT 
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as total_size,
+    pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) as table_size,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename) - pg_relation_size(schemaname||'.'||tablename)) as index_size
+  FROM pg_tables
+  WHERE schemaname IN ('augur_data', 'augur_operations')
+    AND tablename IN ('commits', 'issues', 'pull_requests', 'message', 'collection_status')
+  ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
+")
+print(table_sizes)
+
+cat("\n=== RECORD COUNTS ===\n")
+cat("Commits:", dbGetQuery(con, "SELECT COUNT(*) FROM augur_data.commits")[[1]], "\n")
+cat("Issues:", dbGetQuery(con, "SELECT COUNT(*) FROM augur_data.issues WHERE pull_request IS NULL")[[1]], "\n")
+cat("PRs:", dbGetQuery(con, "SELECT COUNT(*) FROM augur_data.pull_requests")[[1]], "\n")
+cat("Messages:", dbGetQuery(con, "SELECT COUNT(*) FROM augur_data.message")[[1]], "\n")
+```
+
+## Knowledge Production
+
+### Number of Commits (Monthly)
+
+This requires Facade data (commits come from git clone).
+
+```{r}
+query_commits_count <- paste0("
+  SELECT 
+    c.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', c.cmt_author_timestamp)::date as month,
+    COUNT(DISTINCT c.cmt_commit_hash) as num_commits
+  FROM augur_data.commits c
+  JOIN augur_data.repo r ON c.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = c.repo_id
+      WHERE ", collection_filters$commits, "",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY c.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', c.cmt_author_timestamp)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+commits_count_monthly <- dbGetQuery(con, query_commits_count)
+commits_count_monthly
+```
+
+### Cumulative Counts (Issues, PRs, Commits)
+
+Calculate cumulative totals up to each month for issues, PRs, and commits.
+
+```{r}
+cat("Calculating cumulative counts for issues, PRs, and commits...\n")
+
+# Cumulative Issues Count (all issues created up to and including each month)
+query_cumulative_issues <- paste0("
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    months.month,
+    COUNT(i.issue_id) as cumulative_issues_count
+  FROM augur_data.repo r
+  CROSS JOIN (
+    SELECT DISTINCT DATE_TRUNC('month', created_at)::date as month
+    FROM augur_data.issues
+    WHERE created_at IS NOT NULL
+  ) months
+  LEFT JOIN augur_data.issues i ON r.repo_id = i.repo_id 
+    AND DATE_TRUNC('month', i.created_at)::date <= months.month
+    AND i.pull_request IS NULL
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = r.repo_id
+  WHERE ", collection_filters$issues_basic, "",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY r.repo_id, r.repo_git, months.month
+  ORDER BY r.repo_git, months.month DESC;
+")
+
+cumulative_issues <- dbGetQuery(con, query_cumulative_issues)
+cat("Retrieved", nrow(cumulative_issues), "repo-months with cumulative issue counts\n")
+
+# Cumulative PRs Count (all PRs created up to and including each month)
+query_cumulative_prs <- paste0("
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    months.month,
+    COUNT(pr.pull_request_id) as cumulative_prs_count
+  FROM augur_data.repo r
+  CROSS JOIN (
+    SELECT DISTINCT DATE_TRUNC('month', pr_created_at)::date as month
+    FROM augur_data.pull_requests
+    WHERE pr_created_at IS NOT NULL
+  ) months
+  LEFT JOIN augur_data.pull_requests pr ON r.repo_id = pr.repo_id 
+    AND DATE_TRUNC('month', pr.pr_created_at)::date <= months.month
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = r.repo_id
+  WHERE ", collection_filters$prs_basic, "",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY r.repo_id, r.repo_git, months.month
+  ORDER BY r.repo_git, months.month DESC;
+")
+
+cumulative_prs <- dbGetQuery(con, query_cumulative_prs)
+cat("Retrieved", nrow(cumulative_prs), "repo-months with cumulative PR counts\n")
+
+# Cumulative Commits Count (all commits up to and including each month)
+query_cumulative_commits <- paste0("
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    months.month,
+    COUNT(DISTINCT c.cmt_commit_hash) as cumulative_commits_count
+  FROM augur_data.repo r
+  CROSS JOIN (
+    SELECT DISTINCT DATE_TRUNC('month', cmt_author_timestamp)::date as month
+    FROM augur_data.commits
+    WHERE cmt_author_timestamp IS NOT NULL
+  ) months
+  LEFT JOIN augur_data.commits c ON r.repo_id = c.repo_id 
+    AND DATE_TRUNC('month', c.cmt_author_timestamp)::date <= months.month
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = r.repo_id
+  WHERE ", collection_filters$commits, "",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY r.repo_id, r.repo_git, months.month
+  ORDER BY r.repo_git, months.month DESC;
+")
+
+cumulative_commits_direct <- dbGetQuery(con, query_cumulative_commits)
+cat("Retrieved", nrow(cumulative_commits_direct), "repo-months with cumulative commit counts\n")
+```
+
+## Comprehensive Monthly Metrics - All Variables
+
+This section creates a comprehensive monthly dataset with all requested metrics per repo-month, including stars/forks from the augur_aux tables, new contributors, PR/issue counts, and velocity metrics.
+
+### Stars and Forks (Monthly counts from augur_aux tables)
+
+```{r}
+# Monthly stars (new stars added each month)
+query_stars_monthly <- "
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', ars.starred_at)::date as month,
+    COUNT(*) as num_stars
+  FROM augur_aux_repo_stars ars
+  JOIN augur_data.repo r ON ars.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  WHERE ars.starred_at IS NOT NULL
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', ars.starred_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+"
+
+stars_monthly <- dbGetQuery(con, query_stars_monthly)
+cat("Retrieved", nrow(stars_monthly), "repo-months with star data\n")
+
+# Monthly forks (new forks created each month)
+query_forks_monthly <- "
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', arf.fork_created_at)::date as month,
+    COUNT(*) as num_forks
+  FROM augur_aux_repo_forks arf
+  JOIN augur_data.repo r ON arf.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  WHERE arf.fork_created_at IS NOT NULL
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', arf.fork_created_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+"
+
+forks_monthly <- dbGetQuery(con, query_forks_monthly)
+cat("Retrieved", nrow(forks_monthly), "repo-months with fork data\n")
+
+# Calculate cumulative stars and forks
+stars_monthly <- stars_monthly %>%
+  mutate(month = as.Date(month)) %>%
+  arrange(repo_git, month) %>%
+  group_by(repo_git) %>%
+  mutate(cumulative_stars = cumsum(replace_na(num_stars, 0))) %>%
+  ungroup()
+
+forks_monthly <- forks_monthly %>%
+  mutate(month = as.Date(month)) %>%
+  arrange(repo_git, month) %>%
+  group_by(repo_git) %>%
+  mutate(cumulative_forks = cumsum(replace_na(num_forks, 0))) %>%
+  ungroup()
+
+cat("Added cumulative star and fork counts\n")
+```
+
+### PR Contributors (Monthly)
+
+Count contributors who opened PRs each month:
+
+```{r}
+query_pr_contributors_monthly <- paste0("
+  SELECT 
+    pr.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', pr.pr_created_at)::date as month,
+    COUNT(DISTINCT pr.pr_augur_contributor_id) as num_pr_contributors
+  FROM augur_data.pull_requests pr
+  JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+  WHERE ", collection_filters$prs_basic, "
+    AND pr.pr_augur_contributor_id IS NOT NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY pr.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', pr.pr_created_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+pr_contributors_monthly <- dbGetQuery(con, query_pr_contributors_monthly)
+cat("Retrieved", nrow(pr_contributors_monthly), "repo-months with PR contributor data\n")
+```
+
+### New PR Contributors (Monthly)
+
+Contributors who opened their first PR (or first PR in 2+ years) in each month:
+
+```{r}
+query_new_pr_contributors <- paste0("
+  WITH first_pr_per_contributor AS (
+    SELECT 
+      pr.repo_id,
+      pr.pr_augur_contributor_id as cntrb_id,
+      MIN(pr.pr_created_at) as first_pr_date
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$prs_basic, "
+      AND pr.pr_augur_contributor_id IS NOT NULL
+    GROUP BY pr.repo_id, pr.pr_augur_contributor_id
+  ),
+  monthly_pr_contributors AS (
+    SELECT DISTINCT
+      pr.repo_id,
+      pr.pr_augur_contributor_id as cntrb_id,
+      DATE_TRUNC('month', pr.pr_created_at)::date as month,
+      fp.first_pr_date
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    JOIN first_pr_per_contributor fp ON pr.repo_id = fp.repo_id 
+      AND pr.pr_augur_contributor_id = fp.cntrb_id
+    WHERE ", collection_filters$prs_basic, "
+      AND pr.pr_augur_contributor_id IS NOT NULL
+  ),
+  new_in_month AS (
+    SELECT 
+      mp.repo_id,
+      mp.cntrb_id,
+      mp.month,
+      CASE 
+        WHEN DATE_TRUNC('month', mp.first_pr_date)::date = mp.month THEN 1
+        WHEN NOT EXISTS (
+          SELECT 1 
+          FROM augur_data.pull_requests pr2 
+          WHERE pr2.repo_id = mp.repo_id 
+            AND pr2.pr_augur_contributor_id = mp.cntrb_id 
+            AND pr2.pr_created_at >= mp.month - INTERVAL '2 years'
+            AND pr2.pr_created_at < mp.month
+        ) THEN 1
+        ELSE 0
+      END as is_new
+    FROM monthly_pr_contributors mp
+  )
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    nm.month,
+    SUM(nm.is_new) as num_new_pr_contributors
+  FROM new_in_month nm
+  JOIN augur_data.repo r ON nm.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id",
+  if (!is.null(repo_groups_sql)) paste0("\n  WHERE r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, nm.month
+  ORDER BY rg.rg_name, r.repo_git, nm.month DESC;
+")
+
+new_pr_contributors_monthly <- dbGetQuery(con, query_new_pr_contributors)
+cat("Retrieved", nrow(new_pr_contributors_monthly), "repo-months with new PR contributor data\n")
+```
+
+### PR Open to Merge Time (Monthly median - project velocity metric)
+
+```{r}
+query_pr_open2merge_monthly <- paste0("
+  SELECT 
+    pr.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', pr.pr_created_at)::date as month,
+    COUNT(*) FILTER (WHERE pr.pr_merged_at IS NOT NULL) as num_merged_prs,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (pr.pr_merged_at - pr.pr_created_at)) / 3600)
+          FILTER (WHERE pr.pr_merged_at IS NOT NULL)::numeric, 2) as median_pr_open2merge_hours
+  FROM augur_data.pull_requests pr
+  JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+  WHERE ", collection_filters$prs_basic, "",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY pr.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', pr.pr_created_at)
+  HAVING COUNT(*) FILTER (WHERE pr.pr_merged_at IS NOT NULL) > 0
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+pr_open2merge_monthly <- dbGetQuery(con, query_pr_open2merge_monthly)
+cat("Retrieved", nrow(pr_open2merge_monthly), "repo-months with PR merge time data\n")
+```
+
+### Issues Opened and Closed Counts (Monthly)
+
+```{r}
+query_issues_opened_closed <- paste0("
+  SELECT 
+    i.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', i.created_at)::date as month,
+    COUNT(*) as num_issues_opened,
+    COUNT(*) FILTER (WHERE i.closed_at IS NOT NULL 
+                     AND DATE_TRUNC('month', i.closed_at)::date = DATE_TRUNC('month', i.created_at)::date) as num_issues_closed_same_month
+  FROM augur_data.issues i
+  JOIN augur_data.repo r ON i.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+  WHERE ", collection_filters$issues_basic, "
+    AND i.pull_request IS NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY i.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', i.created_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+issues_opened_closed_monthly <- dbGetQuery(con, query_issues_opened_closed)
+cat("Retrieved", nrow(issues_opened_closed_monthly), "repo-months with issue open/close counts\n")
+
+# Also get issues closed by month (regardless of when opened)
+query_issues_closed_by_month <- paste0("
+  SELECT 
+    i.repo_id,
+    r.repo_git,
+    DATE_TRUNC('month', i.closed_at)::date as month,
+    COUNT(*) as num_issues_closed
+  FROM augur_data.issues i
+  JOIN augur_data.repo r ON i.repo_id = r.repo_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+  WHERE ", collection_filters$issues_basic, "
+    AND i.pull_request IS NULL
+    AND i.closed_at IS NOT NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY i.repo_id, r.repo_git, DATE_TRUNC('month', i.closed_at)
+  ORDER BY r.repo_git, month DESC;
+")
+
+issues_closed_by_month <- dbGetQuery(con, query_issues_closed_by_month)
+cat("Retrieved", nrow(issues_closed_by_month), "repo-months with issue close counts\n")
+```
+
+### PRs Opened and Closed Counts (Monthly)
+
+```{r}
+query_prs_opened_closed <- paste0("
+  SELECT 
+    pr.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', pr.pr_created_at)::date as month,
+    COUNT(*) as num_prs_opened,
+    COUNT(*) FILTER (WHERE pr.pr_closed_at IS NOT NULL 
+                     AND DATE_TRUNC('month', pr.pr_closed_at)::date = DATE_TRUNC('month', pr.pr_created_at)::date) as num_prs_closed_same_month,
+    COUNT(*) FILTER (WHERE pr.pr_merged_at IS NOT NULL) as num_prs_merged
+  FROM augur_data.pull_requests pr
+  JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+  WHERE ", collection_filters$prs_basic, "",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY pr.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', pr.pr_created_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+prs_opened_closed_monthly <- dbGetQuery(con, query_prs_opened_closed)
+cat("Retrieved", nrow(prs_opened_closed_monthly), "repo-months with PR open/close counts\n")
+
+# Also get PRs closed by month (regardless of when opened)
+query_prs_closed_by_month <- paste0("
+  SELECT 
+    pr.repo_id,
+    r.repo_git,
+    DATE_TRUNC('month', pr.pr_closed_at)::date as month,
+    COUNT(*) as num_prs_closed
+  FROM augur_data.pull_requests pr
+  JOIN augur_data.repo r ON pr.repo_id = r.repo_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+  WHERE ", collection_filters$prs_basic, "
+    AND pr.pr_closed_at IS NOT NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY pr.repo_id, r.repo_git, DATE_TRUNC('month', pr.pr_closed_at)
+  ORDER BY r.repo_git, month DESC;
+")
+
+prs_closed_by_month <- dbGetQuery(con, query_prs_closed_by_month)
+cat("Retrieved", nrow(prs_closed_by_month), "repo-months with PR close counts\n")
+```
+
+### Total Contributions Count (Monthly)
+
+Count total contribution actions (issues opened + PRs opened + comments):
+
+```{r}
+query_contributions_monthly <- paste0("
+  WITH all_contributions AS (
+    -- Issues opened
+    SELECT 
+      i.repo_id,
+      DATE_TRUNC('month', i.created_at)::date as month
+    FROM augur_data.issues i
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND i.pull_request IS NULL
+    
+    UNION ALL
+    
+    -- PRs opened
+    SELECT 
+      pr.repo_id,
+      DATE_TRUNC('month', pr.pr_created_at)::date as month
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$contributors_core, "
+    
+    UNION ALL
+    
+    -- Issue comments
+    SELECT 
+      m.repo_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.issue_message_ref imr ON m.msg_id = imr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+    
+    UNION ALL
+    
+    -- PR comments
+    SELECT 
+      m.repo_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.pull_request_message_ref pmr ON m.msg_id = pmr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+  )
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    ac.month,
+    COUNT(*) as num_contributions
+  FROM all_contributions ac
+  JOIN augur_data.repo r ON ac.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id",
+  if (!is.null(repo_groups_sql)) paste0("\n  WHERE r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, ac.month
+  ORDER BY rg.rg_name, r.repo_git, ac.month DESC;
+")
+
+contributions_monthly <- dbGetQuery(con, query_contributions_monthly)
+cat("Retrieved", nrow(contributions_monthly), "repo-months with contribution counts\n")
+```
+
+### Contributor Absence Factor (Bus Factor, Monthly)
+
+Smallest number of contributors accounting for at least 50% of monthly contributions. We calculate this for the combined contribution stream and separately for issues, comments, and commits.
+
+```{r}
+build_bus_factor_query <- function(contribution_sql, collection_filter, metric_col) {
+  paste0("
+  WITH all_contributions AS (
+", contribution_sql, "
+  ),
+  contributor_counts AS (
+    SELECT
+      repo_id,
+      month,
+      cntrb_id,
+      COUNT(*) as num_contributions
+    FROM all_contributions
+    GROUP BY repo_id, month, cntrb_id
+  ),
+  ranked_contributors AS (
+    SELECT
+      repo_id,
+      month,
+      cntrb_id,
+      num_contributions,
+      SUM(num_contributions) OVER (
+        PARTITION BY repo_id, month
+      ) as total_contributions,
+      ROW_NUMBER() OVER (
+        PARTITION BY repo_id, month
+        ORDER BY num_contributions DESC, cntrb_id
+      ) as contributor_rank,
+      SUM(num_contributions) OVER (
+        PARTITION BY repo_id, month
+        ORDER BY num_contributions DESC, cntrb_id
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ) as running_contributions
+    FROM contributor_counts
+  )
+  SELECT
+    r.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    rc.month,
+    MIN(rc.contributor_rank) FILTER (
+      WHERE rc.running_contributions >= 0.5 * rc.total_contributions
+    ) as ", metric_col, "
+  FROM ranked_contributors rc
+  JOIN augur_data.repo r ON rc.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id",
+    if (!is.null(repo_groups_sql)) paste0("\n  WHERE r.repo_group_id IN (", repo_groups_sql, ")") else "",
+    "
+  GROUP BY r.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, rc.month
+  ORDER BY rg.rg_name, r.repo_git, rc.month DESC;
+")
+}
+
+bus_factor_core_contribution_sql <- paste0(
+"    -- Issues opened
+    SELECT
+      i.repo_id,
+      i.reporter_id as cntrb_id,
+      DATE_TRUNC('month', i.created_at)::date as month
+    FROM augur_data.issues i
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND i.pull_request IS NULL
+      AND i.reporter_id IS NOT NULL
+
+    UNION ALL
+
+    -- PRs opened
+    SELECT
+      pr.repo_id,
+      pr.pr_augur_contributor_id as cntrb_id,
+      DATE_TRUNC('month', pr.pr_created_at)::date as month
+    FROM augur_data.pull_requests pr
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = pr.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND pr.pr_augur_contributor_id IS NOT NULL
+
+    UNION ALL
+
+    -- Issue comments
+    SELECT
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.issue_message_ref imr ON m.msg_id = imr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND m.cntrb_id IS NOT NULL
+
+    UNION ALL
+
+    -- PR comments
+    SELECT
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.pull_request_message_ref pmr ON m.msg_id = pmr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND m.cntrb_id IS NOT NULL"
+)
+
+bus_factor_issues_sql <- paste0(
+"    -- Issues opened
+    SELECT
+      i.repo_id,
+      i.reporter_id as cntrb_id,
+      DATE_TRUNC('month', i.created_at)::date as month
+    FROM augur_data.issues i
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = i.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND i.pull_request IS NULL
+      AND i.reporter_id IS NOT NULL"
+)
+
+bus_factor_comments_sql <- paste0(
+"    -- Issue comments
+    SELECT
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.issue_message_ref imr ON m.msg_id = imr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND m.cntrb_id IS NOT NULL
+
+    UNION ALL
+
+    -- PR comments
+    SELECT
+      m.repo_id,
+      m.cntrb_id,
+      DATE_TRUNC('month', m.msg_timestamp)::date as month
+    FROM augur_data.message m
+    INNER JOIN augur_data.pull_request_message_ref pmr ON m.msg_id = pmr.msg_id
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = m.repo_id
+    WHERE ", collection_filters$contributors_core, "
+      AND m.cntrb_id IS NOT NULL"
+)
+
+bus_factor_commits_sql <- paste0(
+"    SELECT
+      c.repo_id,
+      c.cmt_ght_author_id as cntrb_id,
+      DATE_TRUNC('month', c.cmt_author_timestamp)::date as month
+    FROM augur_data.commits c
+    INNER JOIN augur_operations.collection_status cs ON cs.repo_id = c.repo_id
+    WHERE ", collection_filters$contributors_with_commits, "
+      AND c.cmt_ght_author_id IS NOT NULL"
+)
+
+query_bus_factor_monthly <- build_bus_factor_query(
+  bus_factor_core_contribution_sql,
+  collection_filters$contributors_core,
+  "bus_factor"
+)
+query_bus_factor_issues_monthly <- build_bus_factor_query(
+  bus_factor_issues_sql,
+  collection_filters$contributors_core,
+  "bus_factor_issues"
+)
+query_bus_factor_comments_monthly <- build_bus_factor_query(
+  bus_factor_comments_sql,
+  collection_filters$contributors_core,
+  "bus_factor_comments"
+)
+query_bus_factor_commits_monthly <- build_bus_factor_query(
+  bus_factor_commits_sql,
+  collection_filters$contributors_with_commits,
+  "bus_factor_commits"
+)
+
+bus_factor_monthly <- dbGetQuery(con, query_bus_factor_monthly)
+bus_factor_issues_monthly <- dbGetQuery(con, query_bus_factor_issues_monthly)
+bus_factor_comments_monthly <- dbGetQuery(con, query_bus_factor_comments_monthly)
+bus_factor_commits_monthly <- dbGetQuery(con, query_bus_factor_commits_monthly)
+cat("Retrieved", nrow(bus_factor_monthly), "repo-months with combined bus factor\n")
+cat("Retrieved", nrow(bus_factor_issues_monthly), "repo-months with issues bus factor\n")
+cat("Retrieved", nrow(bus_factor_comments_monthly), "repo-months with comments bus factor\n")
+cat("Retrieved", nrow(bus_factor_commits_monthly), "repo-months with commits bus factor\n")
+```
+
+### Releases Count (Monthly)
+
+Count number of releases published per month:
+
+```{r}
+query_releases_monthly <- paste0("
+  SELECT 
+    rel.repo_id,
+    r.repo_git,
+    r.repo_name,
+    r.repo_group_id,
+    rg.rg_name as repo_group_name,
+    DATE_TRUNC('month', rel.release_published_at)::date as month,
+    COUNT(*) as num_releases
+  FROM augur_data.releases rel
+  JOIN augur_data.repo r ON rel.repo_id = r.repo_id
+  LEFT JOIN augur_data.repo_groups rg ON r.repo_group_id = rg.repo_group_id
+  INNER JOIN augur_operations.collection_status cs ON cs.repo_id = rel.repo_id
+  WHERE cs.core_status = 'Success'
+    AND rel.release_published_at IS NOT NULL",
+  if (!is.null(repo_groups_sql)) paste0("\n    AND r.repo_group_id IN (", repo_groups_sql, ")") else "",
+  "
+  GROUP BY rel.repo_id, r.repo_git, r.repo_name, r.repo_group_id, rg.rg_name, DATE_TRUNC('month', rel.release_published_at)
+  ORDER BY rg.rg_name, r.repo_git, month DESC;
+")
+
+releases_monthly <- dbGetQuery(con, query_releases_monthly)
+cat("Retrieved", nrow(releases_monthly), "repo-months with release counts\n")
+```
+
+### Repository Age (calculated for each month)
+
+```{r}
+# Get first commit date for each repo
+query_repo_first_commit <- "
+  SELECT 
+    r.repo_id,
+    r.repo_git,
+    MIN(c.cmt_committer_date) as first_commit_date
+  FROM augur_data.repo r
+  LEFT JOIN augur_data.commits c ON r.repo_id = c.repo_id
+  WHERE c.cmt_committer_date IS NOT NULL
+  GROUP BY r.repo_id, r.repo_git;
+"
+
+repo_first_commits <- dbGetQuery(con, query_repo_first_commit)
+cat("Retrieved first commit dates for", nrow(repo_first_commits), "repos\n")
+
+# Note: Age will be calculated dynamically when joining with monthly data
+# age_in_months = months between first_commit_date and the month
+# age_in_years = age_in_months / 12
+```
+
+### Summary: All Monthly Metrics Available
+
+```{r}
+cat("\n=== COMPREHENSIVE MONTHLY METRICS SUMMARY ===\n\n")
+cat("The following metrics are now available per repo-month:\n\n")
+
+cat("POPULARITY METRICS (from augur_aux tables):\n")
+cat("  - num_stars: New stars added in month (stars_monthly)\n")
+cat("  - num_forks: New forks created in month (forks_monthly)\n\n")
+
+cat("CONTRIBUTOR METRICS:\n")
+cat("  - num_contributors: Total unique contributors (contributors_count_monthly)\n")
+cat("  - num_new_contributors: First-time or returning contributors (new_contributors_monthly)\n")
+cat("  - num_pr_contributors: Contributors who opened PRs (pr_contributors_monthly)\n")
+cat("  - num_new_pr_contributors: New PR contributors (new_pr_contributors_monthly)\n")
+cat("  - num_contributions: Total contribution actions (contributions_monthly)\n\n")
+cat("  - bus_factor: Contributor Absence Factor across issues, PRs, and comments (bus_factor_monthly)\n")
+cat("  - bus_factor_issues: Contributor Absence Factor for issues opened (bus_factor_issues_monthly)\n")
+cat("  - bus_factor_comments: Contributor Absence Factor for issue and PR comments (bus_factor_comments_monthly)\n")
+cat("  - bus_factor_commits: Contributor Absence Factor for commits only (bus_factor_commits_monthly)\n\n")
+
+cat("PR METRICS:\n")
+cat("  - num_prs_opened: PRs created in month (prs_opened_closed_monthly)\n")
+cat("  - num_prs_closed: PRs closed in month (prs_closed_by_month)\n")
+cat("  - median_pr_open2merge_hours: Velocity metric (pr_open2merge_monthly)\n\n")
+
+cat("ISSUE METRICS:\n")
+cat("  - num_issues_opened: Issues created in month (issues_opened_closed_monthly)\n")
+cat("  - num_issues_closed: Issues closed in month (issues_closed_by_month)\n")
+cat("  - median_hours_to_close_issue: Time to close issues\n\n")
+
+cat("COMMIT METRICS:\n")
+cat("  - num_commits: Commits in month (commits_count_monthly)\n\n")
+
+cat("RELEASE METRICS:\n")
+cat("  - num_releases: Releases published in month (releases_monthly)\n\n")
+
+cat("REPO AGE:\n")
+cat("  - age_in_months: Calculated from first_commit_date\n")
+cat("  - age_in_years: age_in_months / 12\n\n")
+
+cat("These metrics can be joined by (repo_git, month) to create comprehensive monthly datasets.\n")
+```
+
+## Create and Save Monthly Augur Metrics Dataset
+
+This section consolidates all Augur monthly metrics into a single comprehensive dataset. This dataset can be used independently or merged with ST scores for predictive analysis.
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("CREATING COMPREHENSIVE MONTHLY AUGUR METRICS DATASET\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+
+# Start with a base of all repo-month combinations from repos we care about
+# Get repos from specified groups
+base_repos <- dbGetQuery(con, "
+  SELECT DISTINCT
+    repo_id,
+    repo_git,
+    repo_name,
+    repo_group_id
+  FROM augur_data.repo
+  WHERE repo_group_id IN (100, 200, 300)
+  ORDER BY repo_git;
+")
+
+cat("Base repositories:", nrow(base_repos), "\n")
+cat("  - Group 100:", sum(base_repos$repo_group_id == 100), "\n")
+cat("  - Group 200:", sum(base_repos$repo_group_id == 200), "\n")
+cat("  - Group 300:", sum(base_repos$repo_group_id == 300), "\n\n")
+
+# Create a vector of repo_gits to filter on
+target_repos <- base_repos$repo_git
+cat("Filtering metrics to", length(target_repos), "target repositories\n\n")
+
+# Create comprehensive monthly dataset by merging all metrics
+# We'll use a full outer join approach starting with the most complete metric
+augur_monthly <- NULL
+
+# Function to safely merge metrics
+merge_metric <- function(base_df, new_df, metric_name, target_repos) {
+  if (exists(metric_name) && nrow(get(metric_name)) > 0) {
+    df <- get(metric_name) %>%
+      mutate(month = as.Date(month)) %>%
+      # Filter to only target repos BEFORE merging
+      filter(repo_git %in% target_repos)
+    
+    # Remove redundant metadata columns that will be added later
+    # Keep only repo_git, month, and actual metric columns
+    metadata_cols <- c("repo_id", "repo_name", "repo_group_id", "repo_group_name", 
+                       "rg_name", "rg_description", "tool_source", "tool_version", "data_source")
+    df <- df %>%
+      select(-any_of(metadata_cols))
+    
+    if (is.null(base_df)) {
+      cat("  âœ“ Initialized with", metric_name, ":", nrow(df), "rows\n")
+      return(df)
+    } else {
+      before_count <- nrow(base_df)
+      base_df <- base_df %>%
+        full_join(df, by = c("repo_git", "month"))
+      after_count <- nrow(base_df)
+      cat("  âœ“ Merged", metric_name, ": ", before_count, "â†’", after_count, "rows\n")
+      return(base_df)
+    }
+  } else {
+    cat("  âœ— Skipped", metric_name, "(not found or empty)\n")
+    return(base_df)
+  }
+}
+
+cat("Building comprehensive monthly dataset...\n\n")
+
+# 1. Issues metrics
+cat("1. Issues Metrics:\n")
+
+# Rename columns to avoid conflicts before merging
+if (exists("issues_time_to_first_response_summary") && nrow(issues_time_to_first_response_summary) > 0) {
+  issues_time_to_first_response_summary <- issues_time_to_first_response_summary %>%
+    rename_with(~paste0("issues_tfr_", .), .cols = c("min_hours", "q1_hours", "median_hours", "q3_hours", "max_hours", "mean_hours"))
+}
+
+if (exists("issues_time_to_close_summary") && nrow(issues_time_to_close_summary) > 0) {
+  issues_time_to_close_summary <- issues_time_to_close_summary %>%
+    rename_with(~paste0("issues_ttc_", .), .cols = c("min_hours", "q1_hours", "median_hours", "q3_hours", "max_hours", "mean_hours"))
+}
+
+augur_monthly <- merge_metric(augur_monthly, issues_time_to_first_response_summary, 
+                               "issues_time_to_first_response_summary", target_repos)
+augur_monthly <- merge_metric(augur_monthly, issues_time_to_close_summary, 
+                               "issues_time_to_close_summary", target_repos)
+
+# Handle issues_closure_ratio: rename month_end to month and add prefix
+if (exists("issues_closure_ratio") && nrow(issues_closure_ratio) > 0) {
+  issues_closure_ratio_renamed <- issues_closure_ratio %>%
+    rename(month = month_end) %>%
+    rename_with(~paste0("issues_cr_", .), .cols = c("still_open", "pct_still_open", "closure_ratio_pct"))
+  augur_monthly <- merge_metric(augur_monthly, issues_closure_ratio_renamed, 
+                                 "issues_closure_ratio_renamed", target_repos)
+}
+
+augur_monthly <- merge_metric(augur_monthly, issues_count_monthly, 
+                               "issues_count_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, issues_opened_closed_monthly, 
+                               "issues_opened_closed_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, issues_closed_by_month, 
+                               "issues_closed_by_month", target_repos)
+
+cat("\n2. Pull Request Metrics:\n")
+
+# Rename PR columns to avoid conflicts
+if (exists("prs_time_to_first_response_summary") && nrow(prs_time_to_first_response_summary) > 0) {
+  prs_time_to_first_response_summary <- prs_time_to_first_response_summary %>%
+    rename_with(~paste0("prs_tfr_", .), .cols = c("min_hours", "q1_hours", "median_hours", "q3_hours", "max_hours", "mean_hours"))
+}
+
+if (exists("prs_time_to_close_summary") && nrow(prs_time_to_close_summary) > 0) {
+  prs_time_to_close_summary <- prs_time_to_close_summary %>%
+    rename_with(~paste0("prs_ttc_", .), .cols = c("closed_prs", "min_hours", "q1_hours", "median_hours", "q3_hours", "max_hours", "mean_hours"))
+}
+
+augur_monthly <- merge_metric(augur_monthly, prs_time_to_first_response_summary, 
+                               "prs_time_to_first_response_summary", target_repos)
+augur_monthly <- merge_metric(augur_monthly, prs_time_to_close_summary, 
+                               "prs_time_to_close_summary", target_repos)
+
+# Handle prs_closure_ratio: rename month_end to month and add prefix
+if (exists("prs_closure_ratio") && nrow(prs_closure_ratio) > 0) {
+  prs_closure_ratio_renamed <- prs_closure_ratio %>%
+    rename(month = month_end) %>%
+    rename_with(~paste0("prs_cr_", .), .cols = c("still_open", "pct_still_open", "closure_ratio_pct"))
+  augur_monthly <- merge_metric(augur_monthly, prs_closure_ratio_renamed, 
+                                 "prs_closure_ratio_renamed", target_repos)
+}
+
+augur_monthly <- merge_metric(augur_monthly, prs_count_monthly, 
+                               "prs_count_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, prs_acceptance_monthly, 
+                               "prs_acceptance_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, pr_open2merge_monthly, 
+                               "pr_open2merge_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, prs_opened_closed_monthly, 
+                               "prs_opened_closed_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, prs_closed_by_month, 
+                               "prs_closed_by_month", target_repos)
+
+cat("\n3. Contributor Metrics:\n")
+augur_monthly <- merge_metric(augur_monthly, contributors_count_monthly, 
+                               "contributors_count_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, core_contributors_monthly, 
+                               "core_contributors_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, new_contributors_monthly, 
+                               "new_contributors_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, pr_contributors_monthly, 
+                               "pr_contributors_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, new_pr_contributors_monthly, 
+                               "new_pr_contributors_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, bus_factor_monthly, 
+                               "bus_factor_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, bus_factor_issues_monthly, 
+                               "bus_factor_issues_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, bus_factor_comments_monthly, 
+                               "bus_factor_comments_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, bus_factor_commits_monthly, 
+                               "bus_factor_commits_monthly", target_repos)
+
+cat("\n4. Activity Metrics:\n")
+augur_monthly <- merge_metric(augur_monthly, commits_count_monthly, 
+                               "commits_count_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, contributions_monthly, 
+                               "contributions_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, releases_monthly, 
+                               "releases_monthly", target_repos)
+
+cat("\n5. Popularity Metrics:\n")
+augur_monthly <- merge_metric(augur_monthly, stars_monthly, 
+                               "stars_monthly", target_repos)
+augur_monthly <- merge_metric(augur_monthly, forks_monthly, 
+                               "forks_monthly", target_repos)
+
+cat("\n5b. Cumulative Totals (Issues, PRs, Commits):\n")
+augur_monthly <- merge_metric(augur_monthly, cumulative_issues, 
+                               "cumulative_issues", target_repos)
+augur_monthly <- merge_metric(augur_monthly, cumulative_prs, 
+                               "cumulative_prs", target_repos)
+augur_monthly <- merge_metric(augur_monthly, cumulative_commits_direct, 
+                               "cumulative_commits_direct", target_repos)
+
+# Add repo metadata
+cat("\n6. Adding Repository Metadata:\n")
+augur_monthly <- augur_monthly %>%
+  left_join(base_repos %>% select(repo_git, repo_id, repo_name, repo_group_id), 
+            by = "repo_git")
+
+cat("  âœ“ Added repo_id, repo_name, repo_group_id\n")
+cat("  âœ“ All rows should have metadata (no NAs expected since we filtered before merging)\n")
+
+# Replace NAs with 0 for count variables
+cat("\n7. Replacing NAs with 0 for count columns:\n")
+count_cols <- grep("^num_", names(augur_monthly), value = TRUE)
+cat("  Found", length(count_cols), "count columns to process\n")
+
+for (col in count_cols) {
+  na_count <- sum(is.na(augur_monthly[[col]]))
+  if (na_count > 0) {
+    augur_monthly[[col]][is.na(augur_monthly[[col]])] <- 0
+    cat("  âœ“ Replaced", na_count, "NAs with 0 in", col, "\n")
+  }
+}
+
+# Add dynamic characteristics (age, cumulative metrics, dependencies)
+cat("\n8. Calculating Dynamic Repository Characteristics:\n")
+
+# Get first commit dates for age calculation
+repo_ages <- dbGetQuery(con, "
+  SELECT 
+    r.repo_git,
+    MIN(c.cmt_committer_date::timestamp) as first_commit_date
+  FROM augur_data.repo r
+  LEFT JOIN augur_data.commits c ON r.repo_id = c.repo_id
+  WHERE r.repo_group_id IN (100, 200, 300)
+  GROUP BY r.repo_git
+")
+repo_ages$first_commit_date <- as.Date(repo_ages$first_commit_date)
+
+cat("  âœ“ Retrieved first commit dates for", nrow(repo_ages), "repos\n")
+
+# Calculate age for each repo-month
+augur_monthly <- augur_monthly %>%
+  left_join(repo_ages, by = "repo_git") %>%
+  mutate(
+    repo_age_interval = interval(first_commit_date, month),
+    repo_age_days     = pmax(0, as.numeric(repo_age_interval / days(1))),
+    age_in_months     = pmax(0, round(time_length(repo_age_interval, "months"), 2)),
+    repo_age_years    = pmax(0, round(time_length(repo_age_interval, "years"), 2)),
+    age_in_years      = repo_age_years
+  )
+cat("  âœ“ Calculated repository age\n")
+
+# Calculate cumulative metrics
+augur_monthly <- augur_monthly %>%
+  arrange(repo_git, month) %>%
+  group_by(repo_git) %>%
+  mutate(
+    # Cumulative commits (if we have monthly commits)
+    cumulative_commits = if("num_commits" %in% names(.)) {
+      cumsum(replace_na(num_commits, 0))
+    } else NA_real_,
+    
+    # Cumulative authors (approximate - sum of monthly contributors)
+    cumulative_authors = if("num_contributors" %in% names(.)) {
+      cumsum(replace_na(num_contributors, 0))
+    } else NA_real_,
+    
+    # Cumulative releases
+    cumulative_releases = if("num_releases" %in% names(.)) {
+      cumsum(replace_na(num_releases, 0))
+    } else NA_real_
+  ) %>%
+  ungroup()
+
+cat("  âœ“ Calculated cumulative metrics\n")
+
+# Replace NAs with 0 for all num_* columns (count metrics)
+cat("\n8b. Replacing NAs with 0 for count metrics:\n")
+num_cols <- grep("^num_", names(augur_monthly), value = TRUE)
+augur_monthly <- augur_monthly %>%
+  mutate(across(all_of(num_cols), ~replace_na(., 0)))
+cat("  âœ“ Replaced NAs with 0 for", length(num_cols), "count columns\n")
+
+# Add static repo attributes
+cat("\n9. Adding Static Repository Attributes:\n")
+repo_static <- dbGetQuery(con, "
+  SELECT 
+    repo_git,
+    primary_language,
+    repo_archived,
+    description
+  FROM augur_data.repo
+  WHERE repo_group_id IN (100, 200, 300)
+")
+
+augur_monthly <- augur_monthly %>%
+  left_join(repo_static, by = "repo_git")
+
+cat("  âœ“ Added primary_language, repo_archived, description\n")
+
+# Add dependency metrics (latest snapshot per month)
+cat("\n10. Adding Dependency Metrics:\n")
+dep_data <- dbGetQuery(con, "
+  SELECT 
+    r.repo_git,
+    rd.data_collection_date::date as snapshot_date,
+    COUNT(DISTINCT rd.dep_name) as total_dependencies,
+    COUNT(DISTINCT rd.dep_language) as dependency_languages
+  FROM augur_data.repo r
+  JOIN augur_data.repo_dependencies rd ON r.repo_id = rd.repo_id
+  WHERE r.repo_group_id IN (100, 200, 300)
+    AND rd.data_collection_date IS NOT NULL
+  GROUP BY r.repo_git, rd.data_collection_date::date
+")
+
+if (nrow(dep_data) > 0) {
+  dep_data$snapshot_date <- as.Date(dep_data$snapshot_date)
+  
+  # For each repo-month, find most recent dependency snapshot
+  dep_monthly <- augur_monthly %>%
+    select(repo_git, month) %>%
+    distinct() %>%
+    left_join(dep_data, by = "repo_git", relationship = "many-to-many") %>%
+    filter(!is.na(snapshot_date)) %>%
+    group_by(repo_git, month) %>%
+    filter(snapshot_date <= month) %>%
+    filter(snapshot_date == max(snapshot_date)) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(repo_git, month, total_dependencies, dependency_languages)
+  
+  augur_monthly <- augur_monthly %>%
+    left_join(dep_monthly, by = c("repo_git", "month"))
+  
+  cat("  âœ“ Added dependency metrics for", nrow(dep_monthly), "repo-months\n")
+} else {
+  cat("  âœ— No dependency data available\n")
+}
+
+# Final cleanup and organization
+cat("\n11. Final Dataset Organization:\n")
+
+# Reorganize columns for better readability
+id_cols <- c("repo_id", "repo_git", "repo_name", "repo_group_id", "month")
+age_cols <- c("first_commit_date", "repo_age_days", "age_in_months", "repo_age_years", "age_in_years")
+static_cols <- c("primary_language", "repo_archived", "description")
+cumulative_cols <- grep("^cumulative_", names(augur_monthly), value = TRUE)
+dependency_cols <- c("total_dependencies", "dependency_languages")
+
+# Get all metric columns (everything else)
+metric_cols <- setdiff(names(augur_monthly), 
+                       c(id_cols, age_cols, static_cols, cumulative_cols, dependency_cols))
+
+# Reorder columns
+augur_monthly <- augur_monthly %>%
+  select(all_of(c(id_cols, age_cols, cumulative_cols, static_cols, dependency_cols, metric_cols)))
+
+cat("  âœ“ Reorganized", ncol(augur_monthly), "columns\n")
+
+# Summary statistics
+cat("\n\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("AUGUR MONTHLY DATASET SUMMARY\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+
+cat("Dimensions:", nrow(augur_monthly), "rows x", ncol(augur_monthly), "columns\n\n")
+
+cat("Date Range:\n")
+cat("  - First month:", format(min(augur_monthly$month, na.rm = TRUE)), "\n")
+cat("  - Last month:", format(max(augur_monthly$month, na.rm = TRUE)), "\n")
+cat("  - Total months:", n_distinct(augur_monthly$month), "\n\n")
+
+cat("Repository Coverage:\n")
+cat("  - Unique repositories:", n_distinct(augur_monthly$repo_git), "\n")
+cat("  - Group 100:", sum(augur_monthly$repo_group_id == 100, na.rm = TRUE), "repo-months\n")
+cat("  - Group 200:", sum(augur_monthly$repo_group_id == 200, na.rm = TRUE), "repo-months\n")
+cat("  - Group 300:", sum(augur_monthly$repo_group_id == 300, na.rm = TRUE), "repo-months\n\n")
+
+cat("Metric Categories:\n")
+cat("  - Issues metrics:", sum(grepl("^issues_", names(augur_monthly))), "columns\n")
+cat("  - PR metrics:", sum(grepl("^prs?_", names(augur_monthly))), "columns\n")
+cat("  - Contributor metrics:", sum(grepl("contributor", names(augur_monthly))), "columns\n")
+cat("  - Activity metrics:", sum(grepl("^(commits|contributions|releases)_", names(augur_monthly))), "columns\n")
+cat("  - Popularity metrics:", sum(grepl("^(num_stars|num_forks|cumulative)", names(augur_monthly))), "columns\n\n")
+
+# Check completeness
+cat("Data Completeness (top 20 metrics by coverage):\n")
+completeness <- augur_monthly %>%
+  summarise(across(everything(), ~sum(!is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "non_na_count") %>%
+  mutate(completeness_pct = round(100 * non_na_count / nrow(augur_monthly), 1)) %>%
+  arrange(desc(completeness_pct)) %>%
+  head(20)
+
+print(completeness, n = 20)
+
+# Save the dataset
+cat("\n\nSaving dataset...\n")
+write.csv(augur_monthly, file.path(data_dir, "augur_monthly_metrics.csv"), row.names = FALSE)
+
+library(arrow)
+write_parquet(augur_monthly, file.path(data_dir, "augur_monthly_metrics.parquet"))
+
+cat("\nâœ“ Dataset saved to:\n")
+cat("  - augur_monthly_metrics.csv\n")
+cat("  - augur_monthly_metrics.parquet\n")
+
+# Display sample
+cat("\n\nSample of dataset (first 10 rows, key columns):\n")
+
+# Get available column names for display
+available_cols <- names(augur_monthly)
+display_cols <- c("repo_name", "month", "age_in_months")
+
+# Add metrics if they exist
+if ("cumulative_stars" %in% available_cols) display_cols <- c(display_cols, "cumulative_stars")
+if ("num_contributors" %in% available_cols) display_cols <- c(display_cols, "num_contributors")
+if ("num_issues" %in% available_cols) display_cols <- c(display_cols, "num_issues")
+if ("num_prs" %in% available_cols) display_cols <- c(display_cols, "num_prs")
+if ("num_commits" %in% available_cols) display_cols <- c(display_cols, "num_commits")
+
+augur_monthly %>%
+  select(any_of(display_cols)) %>%
+  head(10) %>%
+  print()
+```
+
+## Forward-Looking Analysis: ST Scores with 6-Month Ahead Metrics
+
+This section creates a dataset that combines socio-technical scores from one month with repository metrics from 6 months later. This enables predictive modeling to understand if ST scores can predict future repository health.
+
+**Note:** This now uses the `augur_monthly_metrics` dataset created above, merged with ST scores.
+
+### Prepare ST Scores Data
+
+First, ensure the st_scores data has proper date formatting and add a column for the target month (6 months ahead):
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(stringr)
+
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("CREATING PREDICTIVE DATASET: ST SCORES â†’ 6-MONTH AHEAD METRICS\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+
+# Prepare st_scores with proper date column and calculate 6-month-ahead date
+st_scores_prepared <- st_scores %>%
+  mutate(
+    # Convert period (YYYYmm format) to Date
+    # Example: 202101 -> 2021-01-01
+    month = as.Date(paste0(period, "01"), format = "%Y%m%d"),
+    
+    # Calculate the target month (6 months ahead)
+    target_month = month %m+% months(6),
+    
+    # Keep the ST score sum we created earlier
+    st_sum = rowSums(select(., st1_supplier_coverage, st2_developer_coverage, st3_edge_density), na.rm = TRUE)
+  ) %>%
+  select(cncf_repo_name, month, target_month, 
+         st1_supplier_coverage, st2_developer_coverage, st3_edge_density, 
+         technical_supplier_count, social_supplier_count, 
+         social_event_count_sum_over_suppliers, social_user_count_sum_over_suppliers)
+
+cat("Prepared ST scores:", nrow(st_scores_prepared), "rows\n")
+cat("  - Date range:", format(min(st_scores_prepared$month)), "to", format(max(st_scores_prepared$month)), "\n")
+cat("  - Target range:", format(min(st_scores_prepared$target_month)), "to", format(max(st_scores_prepared$target_month)), "\n\n")
+
+# Create repository name mapping
+# Get all repos from database for mapping
+all_repos <- dbGetQuery(con, "
+  SELECT 
+    repo_id,
+    repo_git,
+    repo_name,
+    repo_group_id
+  FROM augur_data.repo r
+  ORDER BY repo_git;
+")
+
+# Extract the last two parts of the repo_git URL to match st_scores format
+# Example: "https://github.com/aeraki-mesh/aeraki" -> "aeraki-mesh/aeraki"
+all_repos <- all_repos %>%
+  mutate(
+    repo_name_full = str_extract(repo_git, "[^/]+/[^/]+$")
+  )
+
+# Create a clean mapping table (one row per unique repo_name_full)
+repo_mapping <- all_repos %>%
+  dplyr::select(repo_git, repo_name_full, repo_id, repo_group_id) %>%
+  distinct() %>%
+  group_by(repo_name_full) %>%
+  slice(1) %>%
+  ungroup()
+
+cat("Repository mapping:\n")
+cat("  - Unique repos in mapping:", n_distinct(repo_mapping$repo_name_full), "\n")
+cat("  - Unique repos in st_scores:", n_distinct(st_scores_prepared$cncf_repo_name), "\n\n")
+
+# Start building predictive dataset
+# Join st_scores with repo mapping
+predictive_dataset <- st_scores_prepared %>%
+  left_join(repo_mapping, by = c("cncf_repo_name" = "repo_name_full"), relationship = "many-to-one")
+
+# Report matching statistics
+cat("Matching Results:\n")
+cat("  - Total ST score rows:", nrow(predictive_dataset), "\n")
+cat("  - Successfully matched:", sum(!is.na(predictive_dataset$repo_git)), "\n")
+cat("  - Unmatched:", sum(is.na(predictive_dataset$repo_git)), "\n")
+
+# Show unmatched repos if any
+unmatched_repos <- predictive_dataset %>%
+  filter(is.na(repo_git)) %>%
+  distinct(cncf_repo_name) %>%
+  pull(cncf_repo_name)
+
+if (length(unmatched_repos) > 0) {
+  cat("\n  Unmatched repos from st_scores:\n")
+  print(head(unmatched_repos, 10))
+}
+
+# Filter to only matched rows and specified repo groups
+predictive_dataset <- predictive_dataset %>%
+  filter(!is.na(repo_git)) %>%
+  filter(repo_group_id %in% c(100, 200, 300))
+
+cat("\nAfter filtering to repo groups 100, 200, 300:", nrow(predictive_dataset), "rows\n\n")
+
+# Now merge with augur_monthly TWICE:
+# 1. For month t (same month as ST scores) - suffix "_t"
+# 2. For month t+6 (6 months ahead) - suffix "_t_plus_6"
+cat("Merging augur metrics for month t and month t+6...\n")
+
+if (exists("augur_monthly") && nrow(augur_monthly) > 0) {
+  # Ensure augur_monthly has date type
+  augur_monthly <- augur_monthly %>%
+    mutate(month = as.Date(month))
+  
+  # Prepare augur data (remove duplicate repo identifiers)
+  augur_clean <- augur_monthly %>%
+    select(-repo_id, -repo_name, -repo_group_id)
+  
+  # Join 1: Augur metrics from month t (same month as ST scores)
+  cat("\n1. Merging month t metrics...\n")
+  augur_t <- augur_clean %>%
+    rename_with(~paste0(., "_t"), -c(repo_git, month))
+  
+  before_count <- nrow(predictive_dataset)
+  predictive_dataset <- predictive_dataset %>%
+    left_join(augur_t, 
+              by = c("repo_git" = "repo_git", "month" = "month"))
+  
+  after_count <- nrow(predictive_dataset)
+  cat("  âœ“ Merged month t metrics: ", before_count, "â†’", after_count, "rows\n")
+  
+  # Report matching success for month t
+  metrics_matched_t <- sum(!is.na(predictive_dataset$age_in_months_t))
+  cat("  âœ“ Rows with month t metrics:", metrics_matched_t, "/", nrow(predictive_dataset), 
+      "(", round(100 * metrics_matched_t / nrow(predictive_dataset), 1), "%)\n")
+  
+  # Join 2: Augur metrics from month t+6 (6 months ahead)
+  cat("\n2. Merging month t+6 metrics...\n")
+  augur_t_plus_6 <- augur_clean %>%
+    rename_with(~paste0(., "_t_plus_6"), -c(repo_git, month))
+  
+  before_count <- nrow(predictive_dataset)
+  predictive_dataset <- predictive_dataset %>%
+    left_join(augur_t_plus_6, 
+              by = c("repo_git" = "repo_git", "target_month" = "month"))
+  
+  after_count <- nrow(predictive_dataset)
+  cat("  âœ“ Merged month t+6 metrics: ", before_count, "â†’", after_count, "rows\n")
+  
+  # Report matching success for month t+6
+  metrics_matched_t_plus_6 <- sum(!is.na(predictive_dataset$age_in_months_t_plus_6))
+  cat("  âœ“ Rows with month t+6 metrics:", metrics_matched_t_plus_6, "/", nrow(predictive_dataset), 
+      "(", round(100 * metrics_matched_t_plus_6 / nrow(predictive_dataset), 1), "%)\n")
+  
+} else {
+  cat("  âœ— ERROR: augur_monthly dataset not found!\n")
+  cat("    Please run the 'Create and Save Monthly Augur Metrics Dataset' section first.\n")
+}
+
+cat("\n\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("PREDICTIVE DATASET CREATED\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+
+# Display the result
+cat("Predictive dataset dimensions:", nrow(predictive_dataset), "rows x", ncol(predictive_dataset), "columns\n")
+head(predictive_dataset, 10)
+```
+
+### Summary Statistics of the Predictive Dataset
+
+```{r}
+# Show structure
+library(tidyverse)
+str(predictive_dataset)
+
+# Summary statistics
+cat("\n=== Dataset Overview ===\n")
+cat("Number of unique repositories:", n_distinct(predictive_dataset$repo_git), "\n")
+cat("Date range:", format(min(predictive_dataset$month, na.rm = TRUE)), "to", format(max(predictive_dataset$month, na.rm = TRUE)), "\n")
+cat("Target date range (6 months ahead):", format(min(predictive_dataset$target_month, na.rm = TRUE)), "to", format(max(predictive_dataset$target_month, na.rm = TRUE)), "\n")
+
+# Check for missing data
+cat("\n=== Missing Data Summary ===\n")
+missing_summary <- predictive_dataset %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "missing_count") %>%
+  mutate(missing_pct = round(missing_count / nrow(predictive_dataset) * 100, 2)) %>%
+  arrange(desc(missing_count))
+
+print(missing_summary, n = 50)
+```
+
+### Export the Predictive Dataset
+
+```{r}
+# Save as CSV for further analysis
+write.csv(predictive_dataset, file.path(data_dir, "predictive_dataset_6month_forward.csv"), row.names = FALSE)
+
+# Also save as parquet for efficient storage
+library(arrow)
+write_parquet(predictive_dataset, file.path(data_dir, "predictive_dataset_6month_forward.parquet"))
+
+cat("Dataset saved to:\n")
+cat("  - predictive_dataset_6month_forward.csv\n")
+cat("  - predictive_dataset_6month_forward.parquet\n")
+
+
+```

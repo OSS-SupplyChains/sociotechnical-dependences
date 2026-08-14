@@ -1,49 +1,24 @@
-# History files
+# R / Quarto session files
 .Rhistory
-.Rapp.history
-
-# Session Data files
 .RData
-.RDataTmp
-
-# User-specific files
 .Ruserdata
-
-# Example code in package build process
-*-Ex.R
-
-# Output files from R CMD build
-/*.tar.gz
-
-# Output files from R CMD check
-/*.Rcheck/
-
-# RStudio files
 .Rproj.user/
+.quarto/
 
-# produced vignettes
-vignettes/*.html
-vignettes/*.pdf
+# Rendered documents and generated model outputs
+analysis/*.html
+analysis/*.docx
+analysis/*_files/
+analysis/Results*/
+analysis/Sample Models/
 
-# OAuth2 token, see https://github.com/hadley/httr/releases/tag/v0.3
-.httr-oauth
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+config/local.*
 
-# knitr and R markdown default cache directories
-*_cache/
-/cache/
-
-# Temporary files created by R markdown
-*.utf8.md
-*.knit.md
-
-# R Environment Variables
-.Renviron
-
-# pkgdown site
-docs/
-
-# translation temp files
-po/*~
-
-# RStudio Connect folder
-rsconnect/
+# Derived binary data (CSV versions are the tracked exchange format)
+data/*.rds
+data/*.parquet
+!data/cncf_sociotechnical_scores.parquet

@@ -1,0 +1,4268 @@
+---
+title: "Build Socio-technical Panel"
+format:
+  html: default
+  docx: default
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# Build N-months look-ahead data (configurable)
+
+Note: This dataset will be by joining a) the data collected by and extracted from the augur tool (e.g., issues, prs, commits, contributors, etc.) with b) the socio-technical metrics provided in the parquet file.
+
+The join uses a forward-looking logic: the socio-technical scores (st1, st2, st3, social supplier count, technical supplier count) for a specific month t are mapped to the augur data in month t+N, where N is set via `LOOKAHEAD_MONTHS` in the first code chunk (default: 6). Example with N=6: For month 01-01-2020 we use the socio-technical scores in this month and add the augur data from month 01-07-2020. This way, we can use the socio-technical scores to analyze their impact on future outcomes.
+
+Update: To allow for more flexibility, the dataset now includes all non-socio-technical variables for both month t and t+N. Example: for month 01-01-2020, we have the number of issues for both month 01-01-2020 and month 01-07-2020. This allows us to build models that can control for prior outcomes as well.
+
+**Note:** This now uses the `augur_monthly_metrics` dataset created from SQL queries of the augur database.
+
+### Prepare ST Scores Data
+
+First, ensure the st_scores data has proper date formatting and add a column for the target month (LOOKAHEAD_MONTHS months ahead):
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(arrow)
+library(tidyverse)
+library(easystats)
+
+# Set working directory to script location
+if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+  doc_path <- rstudioapi::getActiveDocumentContext()$path
+  if (!is.null(doc_path) && nzchar(doc_path)) {
+    setwd(dirname(doc_path))
+  }
+}
+
+# Repository-relative location for inputs and reproducible data artifacts.
+data_dir <- file.path("..", "data")
+
+# ============================================================
+# USER CONFIGURATION: ST Scores File and Look-ahead Window
+# ============================================================
+# Choose which ST scores parquet file to use.
+# The filename should reflect the window (e.g. WINDOW=6M, WINDOW=12M).
+st_score_filename <- file.path(data_dir, "cncf_sociotechnical_scores.parquet")  # 12-month window version
+# st_score_filename <- file.path(data_dir, "cncf_sociotechnical_scores_WINDOW=6M.parquet")
+
+# Number of months to look ahead (must match the window in the parquet file).
+# This controls:
+#   - The target_month calculation (t + LOOKAHEAD_MONTHS)
+#   - The column suffixes in the joined dataset (e.g. _t_plus_6, _t_plus_12)
+#   - All downstream variable references and output filenames
+LOOKAHEAD_MONTHS <- 6   # change to 3 for the 3-month window file
+
+# Derived constants (do not edit below this line)
+t_plus_n_suffix <- paste0("_t_plus_", LOOKAHEAD_MONTHS)   # e.g. "_t_plus_6"
+
+# Map ST scores filename -> ST window size (months) for output folder naming.
+# Add entries here if you add new parquet files.
+st_window_map <- c(
+  "cncf_sociotechnical_scores.parquet"           = "12",
+  "cncf_sociotechnical_scores_WINDOW=6M.parquet" = "6"
+)
+st_window_label <- st_window_map[basename(st_score_filename)]
+if (is.na(st_window_label)) {
+  # Fallback: try to extract a number from the filename
+  st_window_label <- regmatches(st_score_filename, regexpr("[0-9]+", st_score_filename))
+  if (length(st_window_label) == 0) st_window_label <- "unknown"
+}
+
+st_scores <- read_parquet(st_score_filename)
+augur_monthly <- read.csv(file.path(data_dir, "augur_monthly_metrics.csv"))
+
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat(sprintf("CREATING PREDICTIVE DATASET: ST SCORES ? %d-MONTH AHEAD METRICS\n", LOOKAHEAD_MONTHS))
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+
+
+
+
+projects <- read.csv(file.path(data_dir, "projects.csv"), stringsAsFactors = FALSE)
+
+normalize_name <- function(x) {
+  x %>%
+    tolower() %>%
+    stringr::str_replace_all("[^a-z0-9]+", " ") %>%
+    stringr::str_squish()
+}
+
+projects_prepared <- projects %>%
+  mutate(
+    project_name_clean = normalize_name(project_name),
+    accepted_date   = as.Date(accepted_date),
+    sandbox_date    = as.Date(sandbox_date),
+    incubating_date = as.Date(incubating_date),
+    graduated_date  = as.Date(graduated_date),
+    archived_date   = as.Date(archived_date)
+  ) %>%
+  select(
+    project_name, project_name_clean,
+    accepted_date, sandbox_date, incubating_date, graduated_date, archived_date
+  )
+
+augur_monthly <- augur_monthly %>%
+  mutate(
+    month = as.Date(month),
+    repo_name_clean = normalize_name(repo_name),
+    repo_name_full = stringr::str_extract(repo_git, "[^/]+/[^/]+$"),
+    repo_name_full_clean = normalize_name(repo_name_full)
+  )
+
+repo_name_uniqueness <- augur_monthly %>%
+  distinct(repo_id, repo_name_clean, repo_name_full_clean) %>%
+  count(repo_name_clean, name = "n_repo_name_clean")
+
+project_name_uniqueness <- projects_prepared %>%
+  count(project_name_clean, name = "n_project_name_clean")
+
+manual_project_name_map <- tibble::tribble(
+  ~repo_name_full_clean, ~project_name_clean,
+  "aeraki mesh aeraki", "aeraki mesh",
+  "argoproj argo cd", "argo",
+  "fluxcd flux2", "flux",
+  "linkerd linkerd2", "linkerd",
+  "open cluster management io api", "open cluster management",
+  "piraeusdatastore piraeus operator", "piraeus datastore",
+  "kubewarden kubewarden controller", "kubewarden",
+  "strimzi strimzi kafka operator", "strimzi",
+  "the update framework python tuf", "the update framework tuf",
+  "networkservicemesh api", "network service mesh",
+  "devfile api", "devfile",
+  "metal3 io baremetal operator", "metal3 io",
+  "cdk8s team cdk8s", "cdk for kubernetes cdk8s",
+  "containernetworking cni", "container network interface cni",
+  "knative community", "knative",
+  "open feature community", "openfeature",
+  "open telemetry community", "opentelemetry",
+  "devspace cloud devspace cloud", "devspace",
+  "dragonflyoss dragonfly", "dragonfly",
+  "emissary ingress emissary", "emissary ingress",
+  "foniod foniod", "fonio",
+  "artifacthub hub", "artifact hub",
+  "openkruise kruise", "openkruise",
+  "nats io nats server", "nats",
+  "networkservicemesh networkservicemesh", "network service mesh",
+  "notaryproject notary", "notary project",
+  "open policy agent opa", "open policy agent opa",
+  "confidential containers operator", "confidential containers",
+  "operator framework operator sdk", "operator framework",
+  "buildpacks pack", "buildpacks",
+  "piraeusdatastore piraeus", "piraeus datastore",
+  # "opcr io policy", 
+  "hexa org policy orchestrator",  "hexa",
+  "open gitops project", "opengitops",
+  "theupdateframework python tuf", "the update framework tuf",
+  "slimtoolkit slim", "slimtoolkit",
+  "servicemeshinterface smi spec",   "service mesh interface smi",
+  "cloudevents spec", "cloudevents",
+  "serverlessworkflow specification", "serverless workflow",
+  "konveyor operator", "konveyor",
+  "tinkerbell tink", "tinkerbell", 
+  "tremor rs tremor runtime", "tremor",
+  # "v6d io v6d", 
+  "vscode kubernetes tools vscode kubernetes tools", "visual studio code kubernetes tools", 
+  "wasmedge wasmedge", "wasmedge runtime",
+  "carvel dev ytt", "carvel"
+)
+
+# # Optional manual overrides for name mismatches between project_name and repo_name
+# # Add rows here only if the automatic normalized-name join misses something.
+# manual_project_name_map <- tibble::tribble(
+#   ~repo_name_clean, ~project_name_clean,
+#   "aeraki", "aeraki mesh",
+#   "argo cd", "argo",
+#   "hub", "artifact hub",
+#   "pack", "buildpacks",
+#   "ytt", "carvel",
+#   "cdk8s", "cdk for kubernetes (cdk8s)",
+#   "spec", "cloudevents",
+#   "operator", "confidential containers",
+#   "api", "devfile",
+#   "dragonfly2", "dragonfly",
+#   "emissary", "emissary-ingress",
+#   "flux2", "flux",
+#   "policy orchestrator", "hexa",
+#   "community", "knative",
+#   "tackle2 operator", "konveyor",
+#   "kubewarden controller", "kubewarden",
+#   "baremetal operator", "metal3-io",
+#   "nats server", "nats",
+#   
+#   # "cert manager", "cert manager",
+#   # "artifacthub",  "artifact hub"
+# )
+
+augur_repo_keys <- augur_monthly %>%
+  distinct(repo_id, repo_git, repo_name, repo_name_clean, repo_name_full, repo_name_full_clean) %>%
+  left_join(repo_name_uniqueness, by = "repo_name_clean") %>%
+  left_join(
+    project_name_uniqueness %>%
+      rename(repo_name_clean = project_name_clean),
+    by = "repo_name_clean"
+  ) %>%
+  left_join(manual_project_name_map, by = "repo_name_full_clean") %>%
+  mutate(
+    project_name_clean_join = case_when(
+      !is.na(project_name_clean) ~ project_name_clean,
+      n_repo_name_clean == 1 & !is.na(n_project_name_clean) & n_project_name_clean == 1 ~ repo_name_clean,
+      TRUE ~ NA_character_
+    )
+  )
+
+projects_joined <- augur_repo_keys %>%
+  left_join(
+    projects_prepared,
+    by = c("project_name_clean_join" = "project_name_clean")
+  )
+
+cat("Project matching summary:\n")
+cat("  Unique repos in Augur:", nrow(augur_repo_keys), "\n")
+cat("  Matched repos:", sum(!is.na(projects_joined$project_name)), "\n")
+cat("  Unmatched repos:", sum(is.na(projects_joined$project_name)), "\n\n")
+
+unmatched_repos <- projects_joined %>%
+  filter(is.na(project_name)) %>%
+  select(repo_id, repo_git, repo_name, repo_name_full, repo_name_clean, repo_name_full_clean) %>%
+  arrange(repo_name_clean)
+
+if (nrow(unmatched_repos) > 0) {
+  cat("Unmatched repos after automatic + manual matching:\n")
+  print(head(unmatched_repos, 50))
+}
+
+
+augur_monthly <- augur_monthly %>%
+  left_join(
+    projects_joined %>%
+      select(
+        repo_id, project_name,
+        accepted_date, sandbox_date, incubating_date, graduated_date, archived_date
+      ),
+    by = "repo_id"
+  ) %>%
+  mutate(
+    cncf_status = case_when(
+      is.na(accepted_date) | month < accepted_date ~ "NotYetAccepted",
+      !is.na(graduated_date) & month >= graduated_date ~ "graduated",
+      !is.na(incubating_date) & month >= incubating_date ~ "incubating",
+      !is.na(sandbox_date) & month >= sandbox_date ~ "sandbox",
+      TRUE ~ "NotYetAccepted"
+    ),
+    cncf_status = factor(
+      cncf_status,
+      levels = c("NotYetAccepted", "sandbox", "incubating", "graduated")
+    )
+  )
+
+cat("\nMonthly CNCF status distribution:\n")
+print(table(augur_monthly$cncf_status, useNA = "ifany"))
+
+
+# Prepare st_scores with proper date column and calculate N-month-ahead date
+st_scores_prepared <- st_scores %>%
+  mutate(
+    # Convert period (YYYYmm format) to Date
+    # Example: 202101 -> 2021-01-01
+    month = as.Date(paste0(period, "01"), format = "%Y%m%d"),
+    
+    # Calculate the target month (LOOKAHEAD_MONTHS months ahead)
+    target_month = month %m+% months(LOOKAHEAD_MONTHS),
+    
+    # Keep the ST score sum we created earlier
+    st_sum = rowSums(select(., st1_supplier_coverage, st2_developer_coverage, st3_edge_density), na.rm = TRUE)
+  ) %>%
+  select(cncf_repo_name, month, target_month, 
+         st1_supplier_coverage, st2_developer_coverage, st3_edge_density, 
+         technical_supplier_count, social_supplier_count, 
+         social_event_count_sum_over_suppliers, social_user_count_sum_over_suppliers)
+
+cat("Prepared ST scores:", nrow(st_scores_prepared), "rows\n")
+cat("  - Date range:", format(min(st_scores_prepared$month)), "to", format(max(st_scores_prepared$month)), "\n")
+cat(sprintf("  - Target range (%d months ahead):", LOOKAHEAD_MONTHS), format(min(st_scores_prepared$target_month)), "to", format(max(st_scores_prepared$target_month)), "\n\n")
+
+# Create repository name mapping
+# we do this by extracting the last two pieces of repo name identifier
+
+# Extract the last two parts of the repo_git URL to match st_scores format
+# Example: "https://github.com/aeraki-mesh/aeraki" -> "aeraki-mesh/aeraki"
+all_repos <- augur_monthly %>%
+  mutate(
+    repo_name_full = str_extract(repo_git, "[^/]+/[^/]+$")
+  )
+
+# Create a clean mapping table (one row per unique repo_name_full)
+repo_mapping <- all_repos %>%
+  dplyr::select(repo_git, repo_name_full, repo_id, repo_group_id) %>%
+  distinct() %>%
+  group_by(repo_name_full) %>%
+  slice(1) %>%
+  ungroup()
+
+cat("Repository mapping:\n")
+cat("  - Unique repos in mapping:", n_distinct(repo_mapping$repo_name_full), "\n")
+cat("  - Unique repos in st_scores:", n_distinct(st_scores_prepared$cncf_repo_name), "\n\n")
+
+# Start building predictive dataset
+# Join st_scores with repo mapping
+predictive_dataset <- st_scores_prepared %>%
+  left_join(repo_mapping, by = c("cncf_repo_name" = "repo_name_full"), relationship = "many-to-one")
+
+# Report matching statistics
+cat("Matching Results:\n")
+cat("  - Total ST score rows:", nrow(predictive_dataset), "\n")
+cat("  - Successfully matched:", sum(!is.na(predictive_dataset$repo_git)), "\n")
+cat("  - Unmatched:", sum(is.na(predictive_dataset$repo_git)), "\n")
+
+# Show unmatched repos if any
+unmatched_repos <- predictive_dataset %>%
+  filter(is.na(repo_git)) %>%
+  distinct(cncf_repo_name) %>%
+  pull(cncf_repo_name)
+
+if (length(unmatched_repos) > 0) {
+  cat("\n  Unmatched repos from st_scores:\n")
+  print(head(unmatched_repos, 10))
+}
+
+# Filter to only matched rows and specified repo groups
+predictive_dataset <- predictive_dataset %>%
+  filter(!is.na(repo_git)) %>%
+  filter(repo_group_id %in% c(100, 200, 300)) %>%
+  mutate(
+    repo_group_factor = factor(
+      as.character(repo_group_id),
+      levels = c("100", "200", "300")
+    )
+  )
+
+cat("\nAfter filtering to repo groups 100, 200, 300:", nrow(predictive_dataset), "rows\n\n")
+
+# Now merge with augur_monthly TWICE:
+# 1. For month t (same month as ST scores) - suffix "_t"
+# 2. For month t+LOOKAHEAD_MONTHS (look-ahead horizon) - suffix t_plus_n_suffix
+cat(sprintf("Merging augur metrics for month t and month t+%d...\n", LOOKAHEAD_MONTHS))
+
+if (exists("augur_monthly") && nrow(augur_monthly) > 0) {
+  # Ensure augur_monthly has date type
+  augur_monthly <- augur_monthly %>%
+    mutate(month = as.Date(month))
+  
+  # Prepare augur data (remove duplicate repo identifiers)
+  augur_clean <- augur_monthly %>%
+    select(-repo_id, -repo_name, -repo_group_id)
+  
+  # Join 1: Augur metrics from month t (same month as ST scores)
+  cat("\n1. Merging month t metrics...\n")
+  augur_t <- augur_clean %>%
+    rename_with(~paste0(., "_t"), -c(repo_git, month))
+  
+  before_count <- nrow(predictive_dataset)
+  predictive_dataset <- predictive_dataset %>%
+    left_join(augur_t, 
+              by = c("repo_git" = "repo_git", "month" = "month"))
+  
+  after_count <- nrow(predictive_dataset)
+  cat("  ? Merged month t metrics: ", before_count, "?", after_count, "rows\n")
+  
+  # Report matching success for month t
+  metrics_matched_t <- sum(!is.na(predictive_dataset$age_in_months_t))
+  cat("  ? Rows with month t metrics:", metrics_matched_t, "/", nrow(predictive_dataset), 
+      "(", round(100 * metrics_matched_t / nrow(predictive_dataset), 1), "%)\n")
+  
+  # Join 2: Augur metrics from month t+LOOKAHEAD_MONTHS ahead
+  cat(sprintf("\n2. Merging month t+%d metrics...\n", LOOKAHEAD_MONTHS))
+  augur_t_plus_n <- augur_clean %>%
+    rename_with(~paste0(., t_plus_n_suffix), -c(repo_git, month))
+  
+  before_count <- nrow(predictive_dataset)
+  predictive_dataset <- predictive_dataset %>%
+    left_join(augur_t_plus_n, 
+              by = c("repo_git" = "repo_git", "target_month" = "month"))
+  
+  after_count <- nrow(predictive_dataset)
+  cat(sprintf("  ? Merged month t+%d metrics: ", LOOKAHEAD_MONTHS), before_count, "?", after_count, "rows\n")
+  
+  # Report matching success for month t+LOOKAHEAD_MONTHS
+  target_age_col <- paste0("age_in_months", t_plus_n_suffix)
+  metrics_matched_t_plus_n <- sum(!is.na(predictive_dataset[[target_age_col]]))
+  cat(sprintf("  ? Rows with month t+%d metrics:", LOOKAHEAD_MONTHS), metrics_matched_t_plus_n, "/", nrow(predictive_dataset), 
+      "(", round(100 * metrics_matched_t_plus_n / nrow(predictive_dataset), 1), "%)\n")
+  
+} else {
+  cat("  ? ERROR: augur_monthly dataset not found!\n")
+  cat("    Please run the 'Create and Save Monthly Augur Metrics Dataset' section first.\n")
+}
+
+cat("\n\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("PREDICTIVE DATASET CREATED\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+
+# Display the result
+cat("Predictive dataset dimensions:", nrow(predictive_dataset), "rows x", ncol(predictive_dataset), "columns\n")
+head(predictive_dataset, 10)
+```
+
+### Summary Statistics of the Predictive Dataset
+
+```{r}
+# Show structure
+str(predictive_dataset)
+
+# Summary statistics
+cat("\n=== Dataset Overview ===\n")
+cat("Number of unique repositories:", n_distinct(predictive_dataset$repo_git), "\n")
+cat("Date range:", format(min(predictive_dataset$month, na.rm = TRUE)), "to", format(max(predictive_dataset$month, na.rm = TRUE)), "\n")
+cat(sprintf("Target date range (%d months ahead):", LOOKAHEAD_MONTHS), format(min(predictive_dataset$target_month, na.rm = TRUE)), "to", format(max(predictive_dataset$target_month, na.rm = TRUE)), "\n")
+
+# Check for missing data
+cat("\n=== Missing Data Summary ===\n")
+missing_summary <- predictive_dataset %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "missing_count") %>%
+  mutate(missing_pct = round(missing_count / nrow(predictive_dataset) * 100, 2)) %>%
+  arrange(desc(missing_count))
+
+print(missing_summary, n = 50)
+```
+
+### Export the Predictive Dataset
+
+```{r}
+# Build output filenames that include the look-ahead window size
+out_csv     <- file.path(data_dir, sprintf("predictive_dataset_%dmonth_forward.csv",     LOOKAHEAD_MONTHS))
+out_parquet <- file.path(data_dir, sprintf("predictive_dataset_%dmonth_forward.parquet", LOOKAHEAD_MONTHS))
+
+# Save as CSV for further analysis
+write.csv(predictive_dataset, out_csv, row.names = FALSE)
+
+# Also save as parquet for efficient storage
+library(arrow)
+write_parquet(predictive_dataset, out_parquet)
+
+cat("Dataset saved to:\n")
+cat("  -", out_csv, "\n")
+cat("  -", out_parquet, "\n")
+
+```
+
+```{r}
+
+# To reload from disk instead of re-running the join, use:
+# predictive_dataset <- read_csv(out_csv)  # out_csv is set dynamically in the Export chunk above
+
+# calculate how many repos we have per repo_group
+repo_counts <- predictive_dataset %>%
+  group_by(repo_group_id) %>%
+  summarise(num_repos = n_distinct(repo_git), .groups = "drop")
+```
+
+# Predictive Dataset Summary
+
+```{r}
+library(kableExtra)
+
+fmt_stat <- function(x, digits = 2) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  format(round(x, digits), nsmall = digits, big.mark = ",")
+}
+
+make_stat_row <- function(group, variable, definition, x, digits = 2) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) {
+    stats <- rep("NA", 4)
+  } else {
+    stats <- c(
+      fmt_stat(mean(x), digits),
+      fmt_stat(stats::sd(x), digits),
+      fmt_stat(min(x), digits),
+      fmt_stat(max(x), digits)
+    )
+  }
+
+  data.frame(
+    Group = group,
+    Variable = variable,
+    Definition = definition,
+    Mean = stats[1],
+    SD = stats[2],
+    Min = stats[3],
+    Max = stats[4],
+    stringsAsFactors = FALSE
+  )
+}
+
+missing_row <- function(group, variable, definition) {
+  data.frame(
+    Group = group,
+    Variable = variable,
+    Definition = definition,
+    Mean = "(not available)",
+    SD = "(not available)",
+    Min = "(not available)",
+    Max = "(not available)",
+    stringsAsFactors = FALSE
+  )
+}
+
+var_row <- function(group, variable, definition, var, digits = 2) {
+  if (!var %in% names(predictive_dataset)) {
+    return(missing_row(group, variable, definition))
+  }
+  make_stat_row(group, variable, definition, predictive_dataset[[var]], digits)
+}
+
+rowmean_row <- function(group, variable, definition, vars, digits = 2) {
+  if (!all(vars %in% names(predictive_dataset))) {
+    return(missing_row(group, variable, definition))
+  }
+  x <- rowMeans(as.data.frame(predictive_dataset[vars]), na.rm = TRUE)
+  make_stat_row(group, variable, definition, x, digits)
+}
+
+sum_row <- function(group, variable, definition, vars, digits = 2) {
+  if (!all(vars %in% names(predictive_dataset))) {
+    return(missing_row(group, variable, definition))
+  }
+  x <- Reduce(`+`, predictive_dataset[vars])
+  make_stat_row(group, variable, definition, x, digits)
+}
+
+velocity_row <- function(group, variable, definition, digits = 2) {
+  needed_vars <- paste0(c("cumulative_commits_count", "cumulative_authors",
+                          "cumulative_prs_count", "cumulative_issues_count"), t_plus_n_suffix)
+  if (!all(needed_vars %in% names(predictive_dataset))) {
+    return(missing_row(group, variable, definition))
+  }
+
+  prs_issues <- predictive_dataset[[paste0("cumulative_prs_count", t_plus_n_suffix)]] +
+    predictive_dataset[[paste0("cumulative_issues_count", t_plus_n_suffix)]]
+  x <- (predictive_dataset[[paste0("cumulative_commits_count", t_plus_n_suffix)]] +
+        predictive_dataset[[paste0("cumulative_authors", t_plus_n_suffix)]] +
+        prs_issues) / 3
+  make_stat_row(group, variable, definition, x, digits)
+}
+
+summary_tbl <- dplyr::bind_rows(
+  var_row("Supply chain related variables", "ST1: Supplier Coverage", "Share of technical suppliers represented in the socio-technical network.", "st1_supplier_coverage", digits = 3),
+  var_row("Supply chain related variables", "ST2: Developer Coverage", "Share of developers connected to the supplier network.", "st2_developer_coverage", digits = 3),
+  var_row("Supply chain related variables", "ST3: Edge Density", "Density of ties in the socio-technical supplier-developer network.", "st3_edge_density", digits = 3),
+  var_row("Supply chain related variables", "Technical Supplier Count", "Number of technical suppliers linked to the focal repository.", "technical_supplier_count", digits = 1),
+  var_row("Supply chain related variables", "Social Supplier Count", "Number of social suppliers linked to the focal repository.", "social_supplier_count", digits = 1),
+
+  rowmean_row("Dependent variables: Responsiveness", "Closure Ratios", "Average of issue and PR closure ratios at the prediction horizon.",
+              paste0(c("issues_cr_closure_ratio_pct", "prs_cr_closure_ratio_pct"), t_plus_n_suffix), digits = 1),
+  rowmean_row("Dependent variables: Responsiveness", "Response Time", "Average of issue and PR mean time-to-first-response at the prediction horizon.",
+              paste0(c("issues_tfr_mean_hours", "prs_tfr_mean_hours"), t_plus_n_suffix), digits = 1),
+  rowmean_row("Dependent variables: Responsiveness", "Closure Time", "Average of issue and PR mean time-to-close at the prediction horizon.",
+              paste0(c("issues_ttc_mean_hours", "prs_ttc_mean_hours"), t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Responsiveness", paste0("Issue Response Time (t+", LOOKAHEAD_MONTHS, ")"), "Average hours to first issue response at the prediction horizon.", paste0("issues_tfr_mean_hours", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Responsiveness", paste0("PR Response Time (t+", LOOKAHEAD_MONTHS, ")"), "Average hours to first PR response at the prediction horizon.", paste0("prs_tfr_mean_hours", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Responsiveness", paste0("Issue Closure Time (t+", LOOKAHEAD_MONTHS, ")"), "Average hours to close issues at the prediction horizon.", paste0("issues_ttc_mean_hours", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Responsiveness", paste0("PR Closure Time (t+", LOOKAHEAD_MONTHS, ")"), "Average hours to close PRs at the prediction horizon.", paste0("prs_ttc_mean_hours", t_plus_n_suffix), digits = 1),
+
+  var_row("Dependent variables: Community", paste0("Monthly Commits (t+", LOOKAHEAD_MONTHS, ")"), "Number of commits at the prediction horizon.", paste0("num_commits", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Community", paste0("Contributors (t+", LOOKAHEAD_MONTHS, ")"), "Number of contributors at the prediction horizon.", paste0("num_contributors", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Community", paste0("Core Contributors (t+", LOOKAHEAD_MONTHS, ")"), "Number of core contributors at the prediction horizon.", paste0("num_core_contributors", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Community", paste0("New Contributors (t+", LOOKAHEAD_MONTHS, ")"), "Number of new contributors at the prediction horizon.", paste0("num_new_contributors", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Community", paste0("Comments Bus Factor (t+", LOOKAHEAD_MONTHS, ")"), "Contributor Absence Factor for issue and PR comments at the prediction horizon.", paste0("bus_factor_comments", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Community", paste0("Commits Bus Factor (t+", LOOKAHEAD_MONTHS, ")"), "Contributor Absence Factor for commits at the prediction horizon.", paste0("bus_factor_commits", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Community", paste0("Issues Bus Factor (t+", LOOKAHEAD_MONTHS, ")"), "Contributor Absence Factor for issues opened at the prediction horizon.", paste0("bus_factor_issues", t_plus_n_suffix), digits = 1),
+
+  var_row("Dependent variables: Growth", paste0("Cumulative Authors (t+", LOOKAHEAD_MONTHS, ")"), "Cumulative authors at the prediction horizon.", paste0("cumulative_authors", t_plus_n_suffix), digits = 1),
+  var_row("Dependent variables: Growth", paste0("Cumulative Commits (t+", LOOKAHEAD_MONTHS, ")"), "Cumulative commits at the prediction horizon.", paste0("cumulative_commits_count", t_plus_n_suffix), digits = 1),
+  sum_row("Dependent variables: Growth", paste0("PRs + Issues Combined (t+", LOOKAHEAD_MONTHS, ")"), "Combined cumulative PR and issue counts at the prediction horizon.",
+          paste0(c("cumulative_prs_count", "cumulative_issues_count"), t_plus_n_suffix), digits = 1),
+  velocity_row("Dependent variables: Growth", paste0("Velocity (t+", LOOKAHEAD_MONTHS, ")"), "Average of cumulative commits, cumulative authors, and combined PRs/issues at the prediction horizon.", digits = 1),
+
+  var_row("Control variables", "Cumulative Stars", "Total stars accumulated by month t.", "cumulative_stars_t", digits = 0),
+  var_row("Control variables", "Cumulative Forks", "Total forks accumulated by month t.", "cumulative_forks_t", digits = 0),
+  var_row("Control variables", "Repository Age (months)", "Repository age in months at month t.", "age_in_months_t", digits = 1)
+)
+
+row_groups <- rle(summary_tbl$Group); names(row_groups$lengths) <- row_groups$values; row_groups <- row_groups$lengths
+tbl_caption <- paste0(
+  "Predictive Dataset Summary  |  ST window: ", st_window_label,
+  " months  |  Look-ahead: ", LOOKAHEAD_MONTHS, " months"
+)
+
+summary_tbl_display <- summary_tbl %>%
+  select(-Group)
+
+if (knitr::is_html_output()) {
+  kable(summary_tbl_display,
+        caption = tbl_caption,
+        align = c("l", "l", "r", "r", "r", "r"),
+        format = "html",
+        row.names = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE,
+                  font_size = 12) %>%
+    row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+    pack_rows(index = row_groups, bold = TRUE, italic = TRUE)
+} else {
+  kable(summary_tbl_display,
+        caption = tbl_caption,
+        align = c("l", "l", "r", "r", "r", "r"),
+        row.names = FALSE)
+}
+```
+
+Predictive dataset coverage: the month-(t) observations span `r format(min(predictive_dataset$month, na.rm = TRUE))` to `r format(max(predictive_dataset$month, na.rm = TRUE))`, and the target month-(t+`r LOOKAHEAD_MONTHS`) observations span `r format(min(predictive_dataset$target_month, na.rm = TRUE))` to `r format(max(predictive_dataset$target_month, na.rm = TRUE))`. The sample includes `r format(n_distinct(predictive_dataset$repo_git), big.mark = ",")` unique repositories and `r format(nrow(predictive_dataset), big.mark = ",")` repo-month observations. Repositories by group are: `r predictive_dataset %>% group_by(repo_group_id) %>% summarise(n = n_distinct(repo_git), .groups = "drop") %>% mutate(str = paste0("Group ", repo_group_id, ": ", n)) %>% pull(str) %>% paste(collapse = "; ")`. Repositories contribute an average of `r format(round(mean(predictive_dataset %>% count(repo_git, name = "n") %>% pull(n)), 1), nsmall = 1)` months of data, with a range from `r predictive_dataset %>% count(repo_git, name = "n") %>% summarise(min_n = min(n), max_n = max(n)) %>% pull(min_n)` to `r predictive_dataset %>% count(repo_git, name = "n") %>% summarise(min_n = min(n), max_n = max(n)) %>% pull(max_n)` months.
+
+------------------------------------------------------------------------
+
+# Build some initial prediction models
+
+The following code builds three models: one using st1_supplier_coverage as independent variable (with various control variables), one for st2_developer_coverage, and one for st3_edge_density.
+
+The function works by specifying a target variable (e.g., issues_tfr_mean_hours) and control variables, followed by a panel regression using repo_id and month (time) as fixed effects and vcov=twoway.
+
+Note the terminology:
+
+ttc = time to close
+
+tfr = time first response
+
+# Panel Regression Models with Fixed Effects
+
+## Model Setup and Data Prep for Panel Analysis
+
+```{r}
+library(fixest)
+
+# ============================================================================
+# USER CONFIGURATION: Define target variable and controls
+# ============================================================================
+
+# Define predictor variables (used across all models)
+predictors <- c("st1_supplier_coverage", "st2_developer_coverage", "st3_edge_density")
+
+# Controls whether adjusted R2 is displayed in regression tables.
+INCLUDE_ADJ_R2_IN_TABLES <- FALSE
+
+# Number of decimal places for coefficient and SE values in all tables.
+# Change to 3 for more compact output, 4 (default) for higher precision.
+TABLE_DECIMAL_DIGITS <- 3
+
+# ── Sub-group analysis: two distinct approaches ──────────────────────────────
+#
+# APPROACH 1 – Interaction terms (INCLUDE_GROUP_INTERACTIONS)
+#   Keeps all data in ONE pooled model and adds an interaction term:
+#     i(GROUP_INTERACTION_VAR, st_var, ref = GROUP_INTERACTION_REFERENCE)
+#   Estimates HOW MUCH the ST slope differs between groups relative to the
+#   reference level.  Research question: "Does the ST effect vary by group?"
+#   Set INCLUDE_GROUP_INTERACTIONS <- TRUE to activate.
+#   GROUP_INTERACTION_VAR: "cncf_status" (default) or "repo_group_factor"
+#   GROUP_INTERACTION_REFERENCE: the baseline level (e.g. "NotYetAccepted",
+#                                or "100" for repo_group_factor).
+#
+# APPROACH 2 – Data subset (LOOP_FILTER_BY_GROUP, in the loop config below)
+#   SUBSETS the panel to a single group value and fits a separate model on
+#   that slice only.  Estimates the ST effect WITHIN that group, with no
+#   cross-group comparison.  Research question: "What is the ST effect for
+#   graduated projects specifically?"
+#   Set LOOP_FILTER_BY_GROUP <- TRUE and choose LOOP_FILTER_VAR /
+#   LOOP_GROUP_SUBSET in the loop configuration chunk.
+# ─────────────────────────────────────────────────────────────────────────────
+INCLUDE_GROUP_INTERACTIONS <- FALSE
+# GROUP_INTERACTION_VAR <- "repo_group_factor"
+# GROUP_INTERACTION_REFERENCE <- "100"
+GROUP_INTERACTION_VAR <- "cncf_status"
+GROUP_INTERACTION_REFERENCE <- "NotYetAccepted"
+
+get_group_var_label <- function(group_var = GROUP_INTERACTION_VAR) {
+  dplyr::case_when(
+    group_var == "repo_group_factor" ~ "repo group",
+    group_var == "cncf_status" ~ "CNCF status",
+    group_var == "cncf_status_t" ~ "CNCF status",
+    TRUE ~ group_var
+  )
+}
+
+resolve_group_var_name <- function(data, group_var, t_suffix = "_t") {
+  candidate_vars <- c(group_var, paste0(group_var, t_suffix))
+  matched_var <- candidate_vars[candidate_vars %in% names(data)][1]
+  
+  if (is.na(matched_var)) {
+    stop(
+      paste0(
+        "The interaction group variable '", group_var,
+        "' was not found in the data. Checked: ",
+        paste(candidate_vars, collapse = ", ")
+      )
+    )
+  }
+  
+  matched_var
+}
+
+get_table_gof_map <- function(include_fe = FALSE) {
+  gof_map <- c("nobs", "r.squared")
+  if (INCLUDE_ADJ_R2_IN_TABLES) {
+    gof_map <- c(gof_map, "adj.r.squared")
+  }
+  if (include_fe) {
+    gof_map <- c(gof_map, "FE: repo_git")
+  }
+  gof_map
+}
+
+format_st_result <- function(coef, se, pval, adjr2, include_adj_r2 = INCLUDE_ADJ_R2_IN_TABLES,
+                             digits = TABLE_DECIMAL_DIGITS) {
+  stars <- ifelse(pval < 0.01, "***",
+                  ifelse(pval < 0.05, "**",
+                         ifelse(pval < 0.1, "*", "")))
+  fmt <- paste0("%.", digits, "f")
+  if (include_adj_r2) {
+    sprintf(paste0(fmt, " (", fmt, ", Adj. R2: %.3f)%s"), coef, se, adjr2, stars)
+  } else {
+    sprintf(paste0(fmt, " (", fmt, ")%s"), coef, se, stars)
+  }
+}
+
+summary_table_note <- function() {
+  effect_note <- if (INCLUDE_GROUP_INTERACTIONS) {
+    paste0(
+      "Reported ST coefficients are baseline effects for ",
+      get_group_var_label(),
+      " = ",
+      GROUP_INTERACTION_REFERENCE,
+      "; interaction terms in the model capture how the other levels differ from that reference."
+    )
+  } else {
+    "Reported ST coefficients are the overall within-repository effects."
+  }
+  
+  if (INCLUDE_ADJ_R2_IN_TABLES) {
+    paste(
+      "Coefficients shown with standard errors (SE) and adjusted R2 in parentheses.",
+      effect_note,
+      "* p<0.1, ** p<0.05, *** p<0.01"
+    )
+  } else {
+    paste(
+      "Coefficients shown with standard errors (SE) in parentheses.",
+      effect_note,
+      "* p<0.1, ** p<0.05, *** p<0.01"
+    )
+  }
+}
+
+get_st_main_coef_name <- function(model, st_var, use_log = TRUE, standardize = FALSE) {
+  target_name <- if (standardize) paste0("zs_", st_var)
+                 else if (use_log) paste0("log1p(", st_var, ")")
+                 else st_var
+  coef_names <- names(stats::coef(model))
+  exact_match <- coef_names[coef_names == target_name]
+  
+  if (length(exact_match) == 1) {
+    return(exact_match)
+  }
+  
+  alt_match <- coef_names[grepl(gsub("([()])", "\\\\\\1", target_name), coef_names, fixed = FALSE) &
+                            !grepl(":", coef_names, fixed = TRUE)]
+  if (length(alt_match) >= 1) {
+    return(alt_match[1])
+  }
+  
+  # Return NA rather than stopping — callers check for NA and return NA_character_
+  # so a single missing coefficient does not abort the whole loop iteration.
+  return(NA_character_)
+}
+
+get_st_interaction_coef_name <- function(model, st_var, group_level, use_log = TRUE, standardize = FALSE) {
+  target_name <- if (standardize) paste0("zs_", st_var)
+                 else if (use_log) paste0("log1p(", st_var, ")")
+                 else st_var
+  coef_names <- names(stats::coef(model))
+  matches <- coef_names[
+    grepl(target_name, coef_names, fixed = TRUE) &
+    grepl(as.character(group_level), coef_names, fixed = TRUE) &
+    grepl(":", coef_names, fixed = TRUE)
+  ]
+  
+  if (length(matches) == 0) {
+    return(NA_character_)
+  }
+  
+  matches[1]
+}
+
+get_coeftable_p_col <- function(coef_table) {
+  p_cols <- grep("^Pr\\(", colnames(coef_table), value = TRUE)
+  if (length(p_cols) == 0) {
+    stop("Could not find a p-value column in coeftable().")
+  }
+  p_cols[1]
+}
+
+extract_st_effects <- function(model, st_var, use_log = TRUE,
+                               include_group_interactions = FALSE,
+                               group_levels = c("100", "200", "300"),
+                               group_ref = GROUP_INTERACTION_REFERENCE,
+                               standardize = FALSE) {
+  coef_vec <- stats::coef(model)
+  vcov_mat <- stats::vcov(model)
+  main_name <- get_st_main_coef_name(model, st_var, use_log = use_log, standardize = standardize)
+  if (is.na(main_name)) {
+    return(data.frame(Group = character(0), Estimate = numeric(0),
+                      SE = numeric(0), PValue = numeric(0),
+                      stringsAsFactors = FALSE))
+  }
+  
+  if (!include_group_interactions) {
+    coef_table <- fixest::coeftable(model)
+    p_col <- get_coeftable_p_col(coef_table)
+    main_estimate <- unname(coef_table[main_name, "Estimate"])
+    main_se <- unname(coef_table[main_name, "Std. Error"])
+    main_p <- unname(coef_table[main_name, p_col])
+    return(data.frame(
+      Group = "All Repos",
+      Estimate = main_estimate,
+      SE = main_se,
+      PValue = main_p,
+      Effect_Label = "Overall ST Effect",
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  effect_rows <- lapply(group_levels, function(g) {
+    if (g == group_ref) {
+      estimate <- unname(coef_vec[main_name])
+      variance <- unname(vcov_mat[main_name, main_name])
+    } else {
+      int_name <- get_st_interaction_coef_name(model, st_var, g, use_log = use_log, standardize = standardize)
+      
+      if (is.na(int_name)) {
+        estimate <- NA_real_
+        variance <- NA_real_
+      } else {
+        estimate <- unname(coef_vec[main_name] + coef_vec[int_name])
+        variance <- unname(
+          vcov_mat[main_name, main_name] +
+          vcov_mat[int_name, int_name] +
+          2 * vcov_mat[main_name, int_name]
+        )
+      }
+    }
+    
+    data.frame(
+      Group = as.character(g),
+      Estimate = estimate,
+      SE = sqrt(variance),
+      PValue = ifelse(
+        is.na(variance) || is.na(estimate),
+        NA_real_,
+        2 * pnorm(abs(estimate / sqrt(variance)), lower.tail = FALSE)
+      ),
+      Effect_Label = paste0("ST Effect (", g, ")"),
+      stringsAsFactors = FALSE
+    )
+  })
+  
+  bind_rows(effect_rows)
+}
+
+get_reference_st_effect <- function(effects_df, group_ref = GROUP_INTERACTION_REFERENCE) {
+  target_group <- as.character(group_ref)
+  
+  if ("Group" %in% names(effects_df) && target_group %in% effects_df$Group) {
+    return(effects_df[effects_df$Group == target_group, , drop = FALSE][1, ])
+  }
+  
+  effects_df[1, , drop = FALSE]
+}
+
+extract_reference_st_main <- function(model, st_var, use_log = TRUE, standardize = FALSE) {
+  coef_name <- get_st_main_coef_name(model, st_var, use_log = use_log, standardize = standardize)
+  if (is.na(coef_name)) {
+    return(data.frame(Estimate = NA_real_, SE = NA_real_, PValue = NA_real_,
+                      stringsAsFactors = FALSE))
+  }
+  coef_table <- fixest::coeftable(model)
+  p_col <- get_coeftable_p_col(coef_table)
+  estimate <- unname(coef_table[coef_name, "Estimate"])
+  se_val <- unname(coef_table[coef_name, "Std. Error"])
+  p_val <- unname(coef_table[coef_name, p_col])
+  
+  data.frame(
+    Estimate = estimate,
+    SE = se_val,
+    PValue = p_val,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Helper: extract estimate/SE/p-value for any named coefficient from a feols model.
+extract_named_coef <- function(model, coef_label) {
+  coef_table <- fixest::coeftable(model)
+  if (!coef_label %in% rownames(coef_table)) {
+    return(list(est = NA_real_, se = NA_real_, pval = NA_real_))
+  }
+  p_col <- get_coeftable_p_col(coef_table)
+  est  <- unname(coef_table[coef_label, "Estimate"])
+  se   <- unname(coef_table[coef_label, "Std. Error"])
+  pval <- unname(coef_table[coef_label, p_col])
+  list(est = est, se = se, pval = pval)
+}
+
+# Helper: return the coefficient label for a control variable given the
+# transformation settings (mirrors the formula construction in build_st_models).
+get_control_coef_name <- function(ctrl_var, use_log = TRUE, standardize = FALSE) {
+  if (standardize) paste0("zs_", ctrl_var)
+  else if (use_log) paste0("log1p(", ctrl_var, ")")
+  else ctrl_var
+}
+
+# TARGET VARIABLE: Choose your dependent variable
+# The suffix (e.g. _t_plus_6 or _t_plus_12) is added automatically from t_plus_n_suffix.
+# Base name examples: 
+#   - "velocity"                       (composite score)
+#   - "issues_tfr_mean_hours"          (mean time to first response on issues)
+#   - "median_hours_to_close_issue"    (median time to close issues)
+#   - "prs_tfr_mean_hours"             (mean PR response time)
+#   - "commits_num_commits"            (monthly commit count)
+#   - "num_contributors"               (active contributors per month)
+#   - Any other numeric base column from predictive_dataset
+
+# TARGET_VARIABLE <- paste0("velocity",                     t_plus_n_suffix)
+# TARGET_VARIABLE <- paste0("median_pr_open2merge_hours",   t_plus_n_suffix)
+# TARGET_VARIABLE <- paste0("median_hours_to_close_issue",  t_plus_n_suffix)
+# TARGET_VARIABLE   <- paste0("issues_ttc_mean_hours",        t_plus_n_suffix)  # CHANGE THIS
+# TARGET_VARIABLE <- paste0("prs_ttc_mean_hours",           t_plus_n_suffix)
+# TARGET_VARIABLE <- paste0("prs_cr_closure_ratio_pct",     t_plus_n_suffix)
+TARGET_VARIABLE <- paste0("issues_tfr_mean_hours",        t_plus_n_suffix)
+# TARGET_VARIABLE <- paste0("prs_tfr_mean_hours",           t_plus_n_suffix)
+
+
+# CONTROL VARIABLES: Independent variables (excluding ST measures)
+# NOTE: Using cumulative counts for stars, forks, and other accumulated metrics
+# Using monthly/period counts for activities (PRs, issues, new contributors)
+CONTROL_VARS <- c(
+  "cumulative_stars_t",       # Total stars accumulated (not monthly additions)
+  "cumulative_forks_t",       # Total forks accumulated (not monthly additions)
+  #"num_new_contributors_t",   # New contributors this month (monthly metric)
+  #"num_new_pr_contributors_t", # New PR contributors this month (monthly metric)
+  #"num_prs_opened_t",          # PRs opened this month (monthly metric)
+  #"num_prs_closed_t",          # PRs closed this month (monthly metric)
+  #"num_issues_opened_t",       # Issues opened this month (monthly metric)
+  #"num_issues_closed_t",       # Issues closed this month (monthly metric)
+  #"cumulative_commits_t",     # Total commits accumulated
+  #"cumulative_authors_t",     # Total unique authors accumulated
+  #"cumulative_releases_t",
+  #"num_contributions_t",      # Contributions this period (monthly metric)
+  "age_in_months_t",           # Repository age
+  "technical_supplier_count",
+  "social_supplier_count"
+)
+
+# ── Open issues / PRs control ─────────────────────────────────────────────────
+# When TRUE, the count of still-open issues and PRs at time t is added as a
+# control variable in all models.  A large backlog of open items can affect
+# many outcomes beyond just responsiveness (e.g. contributor load, bus factor),
+# so including it universally gives a cleaner estimate of the ST score effects.
+ADD_OPEN_ISSUES_CONTROL <- TRUE
+OPEN_ISSUES_CTRL <- "issues_cr_still_open_t"   # open issue count at time t
+OPEN_PRS_CTRL    <- "prs_cr_still_open_t"       # open PR count at time t
+
+# Auto-add open issues/PRs control for the standalone-model target variable
+if (ADD_OPEN_ISSUES_CONTROL) {
+  if (OPEN_ISSUES_CTRL %in% names(predictive_dataset)) {
+    CONTROL_VARS <- unique(c(CONTROL_VARS, OPEN_ISSUES_CTRL))
+  }
+  if (OPEN_PRS_CTRL %in% names(predictive_dataset)) {
+    CONTROL_VARS <- unique(c(CONTROL_VARS, OPEN_PRS_CTRL))
+  }
+}
+
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("PANEL REGRESSION CONFIGURATION\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("Target Variable:", TARGET_VARIABLE, "\n")
+cat("Control Variables:", length(CONTROL_VARS), "\n")
+cat("  ", paste(CONTROL_VARS, collapse = ", "), "\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+
+# ============================================================================
+# Data Preparation
+# ============================================================================
+
+# First, let's check what monthly variables we have available
+cat("Available columns in dataset:\n")
+print(names(predictive_dataset))
+
+# Create the composite velocity score (if needed)
+# Components: commits, authors/contributors, PRs + issues
+# Use log transformation to handle skewness and normalize scale
+
+panel_data <- predictive_dataset %>%
+  # Ensure we have the required variables
+  filter(!is.na(repo_git), !is.na(target_month))
+
+
+# Calculate composite velocity score only if it's the target variable
+vel_target_col     <- paste0("velocity",              t_plus_n_suffix)
+prs_iss_target_col <- paste0("prs_issues_combined",   t_plus_n_suffix)
+
+if (TARGET_VARIABLE == vel_target_col || TARGET_VARIABLE == "velocity") {
+  panel_data <- panel_data %>%
+    mutate(
+      # Create PR + Issue combined metric for month t
+      prs_issues_combined_t = cumulative_prs_count_t + cumulative_issues_count_t,
+      velocity_t = (cumulative_commits_count_t + cumulative_authors_t + prs_issues_combined_t) / 3
+    )
+  
+  # Dynamic column creation for the t+N horizon (uses base-R assignment to avoid NSE complexity)
+  panel_data[[prs_iss_target_col]] <-
+    panel_data[[paste0("cumulative_prs_count",   t_plus_n_suffix)]] +
+    panel_data[[paste0("cumulative_issues_count", t_plus_n_suffix)]]
+  
+  panel_data[[vel_target_col]] <-
+    (panel_data[[paste0("cumulative_commits_count", t_plus_n_suffix)]] +
+     panel_data[[paste0("cumulative_authors",        t_plus_n_suffix)]] +
+     panel_data[[prs_iss_target_col]]) / 3
+  
+  cat("\nVelocity score summary:\n")
+  print(summary(panel_data[[vel_target_col]]))
+  
+  # cat("\nVelocity components correlation:\n")
+  # vel_components <- panel_data %>% 
+  #   select(log_commits, log_authors, log_prs_issues, velocity) %>%
+  #   filter(complete.cases(.))
+  # print(cor(vel_components))
+}
+
+# Check target variable availability
+cat("\n\nTarget Variable Summary:\n")
+if (TARGET_VARIABLE %in% names(panel_data)) {
+  cat("Variable:", TARGET_VARIABLE, "\n")
+  print(summary(panel_data[[TARGET_VARIABLE]]))
+  cat("Non-NA observations:", sum(!is.na(panel_data[[TARGET_VARIABLE]])), "/", nrow(panel_data), "\n")
+} else {
+  cat("ERROR: Target variable '", TARGET_VARIABLE, "' not found in dataset!\n")
+  cat("Available numeric variables:\n")
+  numeric_vars <- names(panel_data)[sapply(panel_data, is.numeric)]
+  print(head(numeric_vars, 30))
+}
+
+# Check data availability
+cat("\n\nData availability check (BEFORE NA handling):\n")
+cat("Total rows:", nrow(panel_data), "\n")
+cat("Rows with target variable:", sum(!is.na(panel_data[[TARGET_VARIABLE]])), "\n")
+cat("Rows with ST1:", sum(!is.na(panel_data$st1_supplier_coverage)), "\n")
+cat("Rows with ST2:", sum(!is.na(panel_data$st2_developer_coverage)), "\n")
+cat("Rows with ST3:", sum(!is.na(panel_data$st3_edge_density)), "\n")
+
+cat("\nControl variable availability:\n")
+for (var in CONTROL_VARS) {
+  if (var %in% names(panel_data)) {
+    cat("  ", var, ":", sum(!is.na(panel_data[[var]])), "/", nrow(panel_data), 
+        "(", round(100 * sum(!is.na(panel_data[[var]])) / nrow(panel_data), 1), "%)\n")
+  } else {
+    cat("  ", var, ": MISSING FROM DATASET\n")
+  }
+}
+
+
+cat("Replaced NAs with 0 for monthly activity metrics\n")
+
+cat("\nControl variable availability (AFTER NA->0 replacement):\n")
+for (var in CONTROL_VARS) {
+  if (var %in% names(panel_data)) {
+    cat("  ", var, ":", sum(!is.na(panel_data[[var]])), "/", nrow(panel_data), 
+        "(", round(100 * sum(!is.na(panel_data[[var]])) / nrow(panel_data), 1), "%)\n")
+  }
+}
+```
+
+## Filter Complete Cases for Panel Models
+
+```{r}
+cat("\n\nFiltering for complete cases...\n")
+
+# Start with target variable and ST measures
+panel_complete <- panel_data %>%
+  filter(
+    # Must have target variable and at least one ST measure
+    !is.na(!!sym(TARGET_VARIABLE)),
+    (!is.na(st1_supplier_coverage) | !is.na(st2_developer_coverage) | !is.na(st3_edge_density))
+  )
+
+cat("After filtering for target + ST variables:", nrow(panel_complete), "rows\n")
+
+# Check each control variable and report
+for (var in CONTROL_VARS) {
+  if (var %in% names(panel_complete)) {
+    n_before <- nrow(panel_complete)
+    panel_complete <- panel_complete %>%
+      filter(!is.na(!!sym(var)))
+    n_after <- nrow(panel_complete)
+    cat("After filtering", var, ":", n_after, "rows (lost", n_before - n_after, ")\n")
+  } else {
+    cat("WARNING: Control variable", var, "not found in dataset - skipping\n")
+  }
+}
+
+# Ensure panel structure (repo x time)
+panel_complete <- panel_complete %>%
+  arrange(repo_git, target_month)
+
+# also, filter out target months after 12-2025 since they are incomplete
+panel_complete <- panel_complete %>%
+  filter(target_month <= as.Date("2026-01-01"))
+
+cat("Panel data structure:\n")
+cat("Repositories:", n_distinct(panel_complete$repo_git), "\n")
+cat("Time periods per repo (avg):", 
+    round(nrow(panel_complete) / n_distinct(panel_complete$repo_git), 1), "\n")
+cat("Total observations:", nrow(panel_complete), "\n")
+cat("Target variable range:", 
+    round(min(panel_complete[[TARGET_VARIABLE]], na.rm = TRUE), 2), "to",
+    round(max(panel_complete[[TARGET_VARIABLE]], na.rm = TRUE), 2), "\n")
+
+# Check balance
+panel_balance <- panel_complete %>%
+  group_by(repo_git) %>%
+  summarise(n_months = n(), .groups = "drop")
+
+cat("\nPanel balance:\n")
+cat("Min months:", min(panel_balance$n_months), "\n")
+cat("Max months:", max(panel_balance$n_months), "\n")
+cat("Mean months:", round(mean(panel_balance$n_months), 1), "\n")
+
+# Save the standalone target's complete-case panel without overwriting the
+# canonical analysis input used by other scripts.
+panel_complete_export <- file.path(
+  data_dir,
+  sprintf("panel_data_%s.csv",
+  gsub("[^A-Za-z0-9_]+", "_", TARGET_VARIABLE)
+  )
+)
+write.csv(panel_complete, panel_complete_export, row.names = FALSE)
+cat("Saved standalone complete-case panel:", panel_complete_export, "\n")
+```
+
+## Function to Build All Three ST Models
+
+```{r}
+
+use_log <- TRUE
+
+# Set TRUE to z-score-standardise all variables (after log1p if use_log = TRUE).
+# Produces beta coefficients on the same scale across all predictors, making it
+# easy to compare ST scores (0-1) with supplier counts (tens/hundreds).
+STANDARDIZE_VARS <- FALSE
+
+# ------------------------------------------------------------
+# Residualized ST scores
+# Removes variance in ST scores explained by the same controls
+# used in the main models, except the open issue/PR backlog controls.
+# ------------------------------------------------------------
+
+residual_excluded_controls <- c(OPEN_ISSUES_CTRL, OPEN_PRS_CTRL)
+residual_controls <- setdiff(CONTROL_VARS, residual_excluded_controls)
+
+residualize_st_score <- function(data, st_var, residual_controls,
+                                 entity_var = "repo_id",
+                                 time_var   = "month",
+                                 use_log    = TRUE) {
+  # FWL-consistent residualization: regress the ST score on controls using
+  # the same two-way fixed effects (entity + time) as the main panel models.
+  # The residuals therefore capture only the within-entity, within-time
+  # variation in the ST score that is orthogonal to the structural controls,
+  # so that robustness checks based on them are fully consistent with the
+  # FWL (Frisch-Waugh-Lovell) theorem.
+  
+  required_vars <- c(st_var, entity_var, time_var, residual_controls)
+  missing_vars <- setdiff(required_vars, names(data))
+  
+  if (length(missing_vars) > 0) {
+    stop(
+      "Missing variables for residualization: ",
+      paste(missing_vars, collapse = ", ")
+    )
+  }
+  
+  data_with_id <- data %>%
+    mutate(.row_id_resid = row_number())
+  
+  # Pre-apply log1p to the ST variable and controls *before* building resid_df.
+  # If we leave log1p() inside the feols formula, feols silently drops rows
+  # where the formula-evaluated value is NaN/Inf but does NOT record those in
+  # obs_selection$obsRemoved (which only tracks singleton removals). This
+  # causes a length mismatch between obs_kept and residuals(), producing
+  # recycled/garbage residuals that can have near-zero within-group variance,
+  # which feols then drops as collinear — cascading into downstream errors.
+  if (use_log) {
+    lhs_col  <- paste0(".lhs.", st_var)
+    rhs_cols <- if (length(residual_controls) > 0L)
+      paste0(".rhs.", residual_controls) else character(0)
+    data_with_id <- data_with_id %>%
+      mutate(
+        !!lhs_col := log1p(!!sym(st_var)),
+        across(all_of(residual_controls), ~ log1p(.x), .names = ".rhs.{.col}")
+      )
+    lhs         <- lhs_col
+    rhs         <- if (length(rhs_cols) > 0L) paste(rhs_cols, collapse = " + ") else "1"
+    finite_cols <- c(lhs_col, rhs_cols)
+  } else {
+    lhs         <- st_var
+    rhs         <- if (length(residual_controls) > 0L) paste(residual_controls, collapse = " + ") else "1"
+    finite_cols <- c(st_var, residual_controls)
+  }
+  
+  cols_to_keep <- unique(c(".row_id_resid", entity_var, time_var, finite_cols))
+  resid_df <- data_with_id %>%
+    select(all_of(cols_to_keep)) %>%
+    drop_na() %>%
+    filter(if_all(all_of(finite_cols), is.finite))
+  
+  if (nrow(resid_df) < 10L) {
+    return(rep(NA_real_, nrow(data)))
+  }
+  
+  resid_formula <- as.formula(
+    paste0(lhs, " ~ ", rhs, " | ", entity_var, " + ", time_var)
+  )
+  
+  # Try feols with two-way clustered SEs (matches main models for consistency).
+  # vcov choice does not affect residuals, only SEs — but twoway can throw hard
+  # errors on small/sparse subsets (too few clusters). We cascade through
+  # progressively simpler SE estimators and fall back to lm() if needed.
+  resid_model <- tryCatch(
+    feols(resid_formula, data = resid_df, vcov = "twoway", fixef.rm = "none"),
+    error = function(e1) {
+      tryCatch(
+        feols(resid_formula, data = resid_df, vcov = "iid", fixef.rm = "none"),
+        error = function(e2) {
+          # lm() fallback: no FE, pooled OLS — less rigorous but keeps loop alive
+          warning(
+            "feols() failed in residualize_st_score for '", st_var, "'; ",
+            "falling back to pooled OLS (residuals are not FWL-consistent).\n",
+            "feols error: ", conditionMessage(e1)
+          )
+          ols_formula <- as.formula(paste0(lhs, " ~ ", if (nzchar(rhs)) rhs else "1"))
+          lm(ols_formula, data = resid_df)
+        }
+      )
+    }
+  )
+  
+  # Map residuals back to the original data rows.
+  out <- rep(NA_real_, nrow(data))
+  if (inherits(resid_model, "fixest")) {
+    resid_values <- residuals(resid_model)
+    
+    if (length(resid_values) == nrow(resid_df)) {
+      obs_kept <- seq_len(nrow(resid_df))
+    } else {
+      obs_removed <- sort(unique(abs(unlist(resid_model$obs_selection))))
+      obs_kept <- setdiff(seq_len(nrow(resid_df)), obs_removed)
+    }
+    
+    out[resid_df$.row_id_resid[obs_kept]] <- resid_values
+  } else {
+    # lm fallback: all rows in resid_df get a residual
+    out[resid_df$.row_id_resid] <- residuals(resid_model)
+  }
+  
+  return(out)
+}
+
+panel_complete <- panel_complete %>%
+  mutate(
+    st1_resid = residualize_st_score(
+      data = panel_complete,
+      st_var = "st1_supplier_coverage",
+      residual_controls = residual_controls
+    ),
+    st2_resid = residualize_st_score(
+      data = panel_complete,
+      st_var = "st2_developer_coverage",
+      residual_controls = residual_controls
+    ),
+    st3_resid = residualize_st_score(
+      data = panel_complete,
+      st_var = "st3_edge_density",
+      residual_controls = residual_controls
+    )
+  )
+
+cat("\nResidualized ST variables created:\n")
+print(summary(panel_complete %>% select(st1_resid, st2_resid, st3_resid)))
+
+# Function to build and summarize all three ST models at once
+build_st_models <- function(data, target_var, control_vars, 
+                            vcov_type = "twoway", 
+                            fixed_effects = "repo_id + month",
+                            use_log = TRUE,
+                            standardize = FALSE,
+                            include_group_interactions = FALSE,
+                            group_var = GROUP_INTERACTION_VAR,
+                            group_ref = GROUP_INTERACTION_REFERENCE,
+                            st_var_keys = c("ST1", "ST2", "ST3")) {
+  
+  # Define ST variables
+  # all_st_vars <- list(
+  #   ST1 = "st1_supplier_coverage",
+  #   ST2 = "st2_developer_coverage",
+  #   ST3 = "st3_edge_density"
+  # )
+  all_st_vars <- list(
+    ST1 = "st1_supplier_coverage",
+    ST2 = "st2_developer_coverage",
+    ST3 = "st3_edge_density",
+    ST1_resid = "st1_resid",
+    ST2_resid = "st2_resid",
+    ST3_resid = "st3_resid"
+  )
+  st_vars <- all_st_vars[intersect(st_var_keys, names(all_st_vars))]
+  if (length(st_vars) == 0) {
+    stop("No valid ST variables selected. Use one or more of: ST1, ST2, ST3.")
+  }
+  
+  # Initialize results list
+  models <- list()
+  model_data <- list()
+  group_var_in_data <- if (include_group_interactions) {
+    resolve_group_var_name(data, group_var)
+  } else {
+    group_var
+  }
+  
+  cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+  cat("BUILDING PANEL REGRESSION MODELS\n")
+  cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+  cat("Target Variable:", target_var, "\n")
+  cat("Control Variables:", paste(control_vars, collapse = ", "), "\n")
+  cat("Fixed Effects:", fixed_effects, "\n")
+  cat("VCOV Type:", vcov_type, "\n")
+  cat("Log Transformation:", use_log, "\n")
+  cat("Standardize Variables:", standardize, "\n")
+  cat("Group Interactions:", include_group_interactions, "\n")
+  if (include_group_interactions) {
+    cat("Interaction Group Variable:", group_var_in_data, "\n")
+    cat("Reference Level:", group_ref, "\n")
+  }
+  cat("\n")
+  
+  # Controls that do not vary within the entity fixed effect are not identified
+  # in a within-repository model, so we drop them up front with an explicit note.
+  entity_fe <- trimws(strsplit(fixed_effects, "\\+")[[1]][1])
+  usable_controls <- control_vars
+  
+  if (entity_fe %in% names(data)) {
+    invariant_controls <- c()
+    
+    for (ctrl in control_vars) {
+      if (ctrl %in% names(data)) {
+        variation_check <- data %>%
+          group_by(.data[[entity_fe]]) %>%
+          summarise(n_vals = n_distinct(.data[[ctrl]], na.rm = TRUE), .groups = "drop")
+        
+        if (all(variation_check$n_vals <= 1, na.rm = TRUE)) {
+          invariant_controls <- c(invariant_controls, ctrl)
+        }
+      }
+    }
+    
+    if (length(invariant_controls) > 0) {
+      cat("Dropping controls collinear with", entity_fe, "fixed effects:\n")
+      cat("  ", paste(invariant_controls, collapse = ", "), "\n\n")
+      usable_controls <- setdiff(control_vars, invariant_controls)
+    }
+  }
+  
+  model_comparison_rows <- list()
+  
+  # Build each model
+  for (st_name in names(st_vars)) {
+    st_var <- st_vars[[st_name]]
+    
+    cat("Building Model", st_name, "...\n")
+    
+    # Filter data for this ST variable
+    model_df <- data %>%
+      filter(!is.na(!!sym(st_var)))
+    
+    
+    # Create formula with log transformation and/or standardization
+    if (standardize) {
+      
+      # Standardize all variables: z-score of log1p(x) if use_log, else z-score of x.
+      all_model_vars <- unique(c(target_var, st_var, usable_controls))
+      
+      for (v in all_model_vars) {
+        if (v %in% names(model_df) && is.numeric(model_df[[v]])) {
+          raw_vals <- if (use_log && !str_detect(v, "_resid$")) {
+            log1p(model_df[[v]])
+          } else {
+            model_df[[v]]
+          }
+          model_df[[paste0("zs_", v)]] <- as.numeric(scale(raw_vals))
+        }
+      }
+      
+      target_formula <- paste0("zs_", target_var)
+      st_formula <- paste0("zs_", st_var)
+      
+      controls_formula <- if (length(usable_controls) > 0) {
+        paste(paste0("zs_", usable_controls), collapse = " + ")
+      } else {
+        ""
+      }
+      
+      interaction_formula <- if (include_group_interactions) {
+        paste0("i(", group_var_in_data, ", ", st_formula, ", ref = '", group_ref, "')")
+      } else {
+        ""
+      }
+      
+      rhs_terms <- c(st_formula, interaction_formula, controls_formula)
+      rhs_terms <- rhs_terms[nzchar(rhs_terms)]
+      
+      formula_str <- paste0(
+        target_formula,
+        " ~ ",
+        paste(rhs_terms, collapse = " + "),
+        " | ",
+        fixed_effects
+      )
+      
+    } else if (use_log) {
+      
+      # Log-transform dependent variable and controls.
+      # Do not log residualized ST variables because residuals can be negative.
+      target_formula <- paste0("log1p(", target_var, ")")
+      
+      st_formula <- if (str_detect(st_var, "_resid$")) {
+        st_var
+      } else {
+        paste0("log1p(", st_var, ")")
+      }
+      
+      controls_formula <- if (length(usable_controls) > 0) {
+        paste(sapply(usable_controls, function(x) paste0("log1p(", x, ")")), collapse = " + ")
+      } else {
+        ""
+      }
+      
+      interaction_formula <- if (include_group_interactions) {
+        paste0("i(", group_var_in_data, ", ", st_formula, ", ref = '", group_ref, "')")
+      } else {
+        ""
+      }
+      
+      rhs_terms <- c(st_formula, interaction_formula, controls_formula)
+      rhs_terms <- rhs_terms[nzchar(rhs_terms)]
+      
+      formula_str <- paste0(
+        target_formula,
+        " ~ ",
+        paste(rhs_terms, collapse = " + "),
+        " | ",
+        fixed_effects
+      )
+      
+    } else {
+      
+      # No transformation
+      target_formula <- target_var
+      st_formula <- st_var
+      
+      controls_formula <- if (length(usable_controls) > 0) {
+        paste(usable_controls, collapse = " + ")
+      } else {
+        ""
+      }
+      
+      interaction_formula <- if (include_group_interactions) {
+        paste0("i(", group_var_in_data, ", ", st_formula, ", ref = '", group_ref, "')")
+      } else {
+        ""
+      }
+      
+      rhs_terms <- c(st_formula, interaction_formula, controls_formula)
+      rhs_terms <- rhs_terms[nzchar(rhs_terms)]
+      
+      formula_str <- paste0(
+        target_formula,
+        " ~ ",
+        paste(rhs_terms, collapse = " + "),
+        " | ",
+        fixed_effects
+      )
+    }
+    # Estimate model — cascade from twoway → iid so sparse-cluster subsets
+    # (e.g. targets with many NA rows) don't abort the whole loop iteration.
+    model <- tryCatch(
+      feols(as.formula(formula_str), data = model_df, vcov = vcov_type),
+      error = function(e1) {
+        if (identical(vcov_type, "twoway")) {
+          warning("feols(vcov='twoway') failed for ", st_name, "/", target_var,
+                  "; retrying with vcov='iid'. Error: ", conditionMessage(e1))
+          tryCatch(
+            feols(as.formula(formula_str), data = model_df, vcov = "iid"),
+            error = function(e2) stop(conditionMessage(e2))
+          )
+        } else {
+          stop(conditionMessage(e1))
+        }
+      }
+    )
+    
+    # Store results
+    models[[st_name]] <- model
+    model_data[[st_name]] <- model_df
+    
+    # Build null model on the SAME sample as the ST model
+    null_rhs_i <- if (length(usable_controls) > 0) {
+      controls_formula
+    } else {
+      "1"
+    }
+    
+    null_formula_str_i <- paste0(
+      target_formula, " ~ ", null_rhs_i, " | ", fixed_effects
+    )
+    
+    null_model_i <- feols(
+      as.formula(null_formula_str_i),
+      data = model_df,
+      vcov = vcov_type
+    )
+    
+    # Safety check BEFORE using model inside tibble()
+    if (!inherits(model, "fixest")) {
+      stop(
+        "The object returned by feols() is not a fixest model. Class is: ",
+        paste(class(model), collapse = ", "),
+        "\nFormula was: ", formula_str
+      )
+    }
+    
+    # Extract fit statistics before tibble() to avoid name conflicts
+    n_obs_i <- nobs(model)
+    
+    wr2_null_i <- unname(fixest::r2(null_model_i, type = "wr2"))
+    wr2_st_i   <- unname(fixest::r2(model, type = "wr2"))
+    
+    ar2_null_i <- unname(fixest::r2(null_model_i, type = "ar2"))
+    ar2_st_i   <- unname(fixest::r2(model, type = "ar2"))
+    
+    aic_null_i <- AIC(null_model_i)
+    aic_st_i   <- AIC(model)
+    
+    bic_null_i <- BIC(null_model_i)
+    bic_st_i   <- BIC(model)
+    
+    # Store model comparison
+    model_comparison_rows[[st_name]] <- tibble(
+      model_name = st_name,
+      n_obs = n_obs_i,
+      n_repo = n_distinct(model_df$repo_id),
+      n_month = n_distinct(model_df$target_month),
+    
+      wr2_null = wr2_null_i,
+      wr2_st = wr2_st_i,
+      delta_wr2 = wr2_st_i - wr2_null_i,
+    
+      ar2_null = ar2_null_i,
+      ar2_st = ar2_st_i,
+      delta_ar2 = ar2_st_i - ar2_null_i,
+    
+      aic_null = aic_null_i,
+      aic_st = aic_st_i,
+      delta_aic = aic_st_i - aic_null_i,
+    
+      bic_null = bic_null_i,
+      bic_st = bic_st_i,
+      delta_bic = bic_st_i - bic_null_i
+    )
+  }
+  
+  cat("  - Observations:", n_obs_i, "\n")
+  cat("  - Repositories:", n_distinct(model_df$repo_id), "\n")
+  cat("  - Months:", n_distinct(model_df$target_month), "\n")
+  cat("  - R² (within):", round(wr2_st_i, 4), "\n\n")
+  
+  # Build null model (controls only, no ST variables — useful as a baseline)
+  cat("Building Null model (no ST variables, controls only)...\n")
+  
+  null_df <- data
+  
+  if (standardize) {
+    
+    all_null_vars <- unique(c(target_var, usable_controls))
+    
+    for (v in all_null_vars) {
+      if (v %in% names(null_df) && is.numeric(null_df[[v]])) {
+        raw_vals <- if (use_log && !str_detect(v, "_resid$")) {
+          log1p(null_df[[v]])
+        } else {
+          null_df[[v]]
+        }
+        null_df[[paste0("zs_", v)]] <- as.numeric(scale(raw_vals))
+      }
+    }
+    
+    null_target <- paste0("zs_", target_var)
+    
+    null_controls <- if (length(usable_controls) > 0) {
+      paste(paste0("zs_", usable_controls), collapse = " + ")
+    } else {
+      "1"
+    }
+    
+    null_formula_str <- paste0(
+      null_target,
+      " ~ ",
+      null_controls,
+      " | ",
+      fixed_effects
+    )
+    
+  } else if (use_log) {
+    
+    null_target <- paste0("log1p(", target_var, ")")
+    
+    null_controls <- if (length(usable_controls) > 0) {
+      paste(sapply(usable_controls, function(x) paste0("log1p(", x, ")")), collapse = " + ")
+    } else {
+      "1"
+    }
+    
+    null_formula_str <- paste0(
+      null_target,
+      " ~ ",
+      null_controls,
+      " | ",
+      fixed_effects
+    )
+    
+  } else {
+    
+    null_target <- target_var
+    
+    null_controls <- if (length(usable_controls) > 0) {
+      paste(usable_controls, collapse = " + ")
+    } else {
+      "1"
+    }
+    
+    null_formula_str <- paste0(
+      null_target,
+      " ~ ",
+      null_controls,
+      " | ",
+      fixed_effects
+    )
+  }
+  
+  null_model <- tryCatch(
+    feols(as.formula(null_formula_str), data = null_df, vcov = vcov_type),
+    error = function(e1) {
+      if (identical(vcov_type, "twoway")) {
+        warning("feols(vcov='twoway') failed for Null model/", target_var,
+                "; retrying with vcov='iid'. Error: ", conditionMessage(e1))
+        tryCatch(
+          feols(as.formula(null_formula_str), data = null_df, vcov = "iid"),
+          error = function(e2) stop(conditionMessage(e2))
+        )
+      } else {
+        stop(conditionMessage(e1))
+      }
+    }
+  )
+  
+  models[["Null"]]     <- null_model
+  model_data[["Null"]] <- null_df
+  
+  cat("  - Observations:", nobs(null_model), "\n")
+  cat("  - Repositories:", n_distinct(null_df$repo_id), "\n")
+  cat("  - R² (within):", round(r2(null_model, type = "wr2"), 4), "\n\n")
+  
+  
+  cat("All models built successfully!\n\n")
+  
+  # Return results
+  return(list(
+    models = models,
+    data = model_data,
+    model_comparison = bind_rows(model_comparison_rows),
+    target_var = target_var,
+    control_vars = usable_controls,
+    st_vars = st_vars,
+    include_group_interactions = include_group_interactions,
+    group_var = group_var_in_data,
+    group_ref = group_ref,
+    standardize = standardize
+  ))
+}
+
+# Build all three models
+results <- build_st_models(
+  data = panel_complete,
+  target_var = TARGET_VARIABLE,
+  control_vars = CONTROL_VARS,
+  vcov_type = "twoway",
+  fixed_effects = "repo_id + month",
+  use_log = use_log,  # Enable log transformation for all variables
+  standardize = STANDARDIZE_VARS,
+  include_group_interactions = INCLUDE_GROUP_INTERACTIONS,
+  group_var = GROUP_INTERACTION_VAR,
+  group_ref = GROUP_INTERACTION_REFERENCE
+)
+
+results_resid <- build_st_models(
+  data = panel_complete,
+  target_var = TARGET_VARIABLE,
+  control_vars = residual_controls,
+  vcov_type = "twoway",
+  fixed_effects = "repo_id + month",
+  use_log = TRUE,
+  standardize = STANDARDIZE_VARS,
+  include_group_interactions = FALSE,
+  st_var_keys = c("ST1_resid", "ST2_resid", "ST3_resid")
+)
+
+results_resid_with_controls <- build_st_models(
+  data = panel_complete,
+  target_var = TARGET_VARIABLE,
+  control_vars = residual_controls,
+  vcov_type = "twoway",
+  fixed_effects = "repo_id + month",
+  use_log = TRUE,
+  standardize = STANDARDIZE_VARS,
+  include_group_interactions = FALSE,
+  st_var_keys = c("ST1_resid", "ST2_resid", "ST3_resid")
+)
+
+model1_resid_fe <- results_resid$models$ST1_resid
+model2_resid_fe <- results_resid$models$ST2_resid
+model3_resid_fe <- results_resid$models$ST3_resid
+# Extract for convenience
+model1_fe <- results$models$ST1
+model2_fe <- results$models$ST2
+model3_fe <- results$models$ST3
+null_model <- results$models$Null
+
+model1_data <- results$data$ST1
+model2_data <- results$data$ST2
+model3_data <- results$data$ST3
+null_model_data <- results$data$Null
+
+# comparison against the null model - what impact do the ST scores have on the model fit?
+model_comparison <- results$model_comparison
+
+model1_resid_fe <- results_resid$models$ST1_resid
+model2_resid_fe <- results_resid$models$ST2_resid
+model3_resid_fe <- results_resid$models$ST3_resid
+
+model_comparison_resid <- results_resid$model_comparison
+
+st_resid_diagnostics <- tibble(
+  st_score = c("ST1", "ST2", "ST3"),
+  r2_explained_by_controls = c(
+    summary(lm(log1p(st1_supplier_coverage) ~ 
+                 log1p(cumulative_stars_t) +
+                 log1p(cumulative_forks_t) +
+                 log1p(age_in_months_t) +
+                 log1p(technical_supplier_count) +
+                 log1p(social_supplier_count),
+               data = panel_complete))$r.squared,
+    
+    summary(lm(log1p(st2_developer_coverage) ~ 
+                 log1p(cumulative_stars_t) +
+                 log1p(cumulative_forks_t) +
+                 log1p(age_in_months_t) +
+                 log1p(technical_supplier_count) +
+                 log1p(social_supplier_count),
+               data = panel_complete))$r.squared,
+    
+    summary(lm(log1p(st3_edge_density) ~ 
+                 log1p(cumulative_stars_t) +
+                 log1p(cumulative_forks_t) +
+                 log1p(age_in_months_t) +
+                 log1p(technical_supplier_count) +
+                 log1p(social_supplier_count),
+               data = panel_complete))$r.squared
+  )
+)
+
+print(st_resid_diagnostics)
+
+```
+
+## Print Individual Model Summaries
+
+```{r}
+
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("MODEL 0: Null - Only Technical and Social Supplier Counts \n")
+cat("Fixed Effects Panel Regression with Robust Standard Errors\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+print(summary(null_model))
+
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("MODEL 1: ST1 (Supplier Coverage) Ã¢â€ â€™", TARGET_VARIABLE, "\n")
+cat("Fixed Effects Panel Regression with Robust Standard Errors\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+print(summary(model1_fe))
+
+cat("\n\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("MODEL 2: ST2 (Developer Coverage) Ã¢â€ â€™", TARGET_VARIABLE, "\n")
+cat("Fixed Effects Panel Regression with Robust Standard Errors\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+print(summary(model2_fe))
+
+cat("\n\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("MODEL 3: ST3 (Edge Density) Ã¢â€ â€™", TARGET_VARIABLE, "\n")
+cat("Fixed Effects Panel Regression with Robust Standard Errors\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+print(summary(model3_fe))
+```
+
+## Publication-Ready Model Comparison Tables
+
+```{r}
+library(modelsummary)
+library(kableExtra)
+library(webshot2)
+
+# Create list of models (null baseline + ST models)
+models_list <- list(
+  "Null: Controls Only" = null_model,
+  "ST1: Supplier Coverage" = model1_fe,
+  "ST2: Developer Coverage" = model2_fe,
+  "ST3: Edge Density" = model3_fe
+)
+
+# Create publication-ready table with robust standard errors
+# fixest models already have robust SEs specified, so we use those
+cat("\n\n=== PANEL REGRESSION RESULTS TABLE ===\n\n")
+
+target_var_text <- ifelse(use_log, paste0("log1p(", TARGET_VARIABLE, ")"), TARGET_VARIABLE)
+interaction_note <- if (INCLUDE_GROUP_INTERACTIONS) {
+  paste0(
+    "ST interactions included with ",
+    get_group_var_label(),
+    " ",
+    GROUP_INTERACTION_REFERENCE,
+    " as the reference category."
+  )
+} else {
+  "No repo-group interaction terms included."
+}
+
+modelsummary(
+  models_list,
+  stars = c('*' = 0.1, '**' = 0.05, '***' = 0.01),
+  estimate  = "{estimate}{stars} ({std.error})",
+  statistic = NULL,
+  # coef_rename = c(
+  #   "st1_supplier_coverage" = "ST1: Supplier Coverage",
+  #   "st2_developer_coverage" = "ST2: Developer Coverage", 
+  #   "st3_edge_density" = "ST3: Edge Density",
+  #   "cumulative_stars" = "Cumulative Stars",
+  #   "cumulative_forks" = "Cumulative Forks",
+  #   "cumulative_commits" = "Cumulative Commits",
+  #   "cumulative_authors" = "Cumulative Authors",
+  #   "num_new_contributors" = "New Contributors (monthly)",
+  #   "num_new_pr_contributors" = "New PR Contributors (monthly)",
+  #   "median_pr_open2merge_hours" = "PR Open-to-Merge Time",
+  #   "median_hours_to_close_issue" = "Issue Close Time",
+  #   "num_pr_opened" = "PRs Opened",
+  #   "num_pr_closed" = "PRs Closed",
+  #   "num_issue_opened" = "Issues Opened",
+  #   "num_issue_closed" = "Issues Closed",
+  #   "num_contributors" = "Active Contributors",
+  #   "num_contributions" = "Total Contributions",
+  #   "age_in_months" = "Repository Age (months)"
+  # ),
+  gof_map = c(get_table_gof_map(include_fe = TRUE), "adj.r.squared"),
+  fmt = 4,
+  title = paste("Fixed Effects Panel Regression Results: Impact of Socio-Technical Metrics on", target_var_text),
+  notes = list(
+    "Robust standard errors (HC1) in parentheses.",
+    "All models include repository-level fixed effects.",
+    interaction_note,
+    "Significance: * p<0.1, ** p<0.05, *** p<0.01"
+  )#,
+#  output = paste0("panel_reg_results_", TARGET_VARIABLE,".html")
+)
+
+
+# Create a summary statistics table comparing the three models
+cat("\n\n=== MODEL DIAGNOSTICS COMPARISON ===\n\n")
+
+# Extract ST effects from fixest models
+model1_effects <- extract_st_effects(
+  model1_fe, "st1_supplier_coverage", use_log = use_log,
+  include_group_interactions = INCLUDE_GROUP_INTERACTIONS,
+  group_ref = GROUP_INTERACTION_REFERENCE,
+  standardize = STANDARDIZE_VARS
+)
+model2_effects <- extract_st_effects(
+  model2_fe, "st2_developer_coverage", use_log = use_log,
+  include_group_interactions = INCLUDE_GROUP_INTERACTIONS,
+  group_ref = GROUP_INTERACTION_REFERENCE,
+  standardize = STANDARDIZE_VARS
+)
+model3_effects <- extract_st_effects(
+  model3_fe, "st3_edge_density", use_log = use_log,
+  include_group_interactions = INCLUDE_GROUP_INTERACTIONS,
+  group_ref = GROUP_INTERACTION_REFERENCE,
+  standardize = STANDARDIZE_VARS
+)
+
+model1_base <- extract_reference_st_main(model1_fe, "st1_supplier_coverage", use_log = use_log, standardize = STANDARDIZE_VARS)
+model2_base <- extract_reference_st_main(model2_fe, "st2_developer_coverage", use_log = use_log, standardize = STANDARDIZE_VARS)
+model3_base <- extract_reference_st_main(model3_fe, "st3_edge_density", use_log = use_log, standardize = STANDARDIZE_VARS)
+
+model1_coef <- model1_base$Estimate
+model1_se <- model1_base$SE
+model1_pval <- model1_base$PValue
+
+model2_coef <- model2_base$Estimate
+model2_se <- model2_base$SE
+model2_pval <- model2_base$PValue
+
+model3_coef <- model3_base$Estimate
+model3_se <- model3_base$SE
+model3_pval <- model3_base$PValue
+
+diagnostics_df <- data.frame(
+  Metric = c(
+    "Observations",
+    "Repositories", 
+    "Avg. Time Periods",
+    "R² (Within)",
+    "R² (Adjusted)",
+    if (INCLUDE_GROUP_INTERACTIONS) paste0("ST Effect (", get_group_var_label(), " = ", GROUP_INTERACTION_REFERENCE, ")") else "ST Coefficient",
+    if (INCLUDE_GROUP_INTERACTIONS) paste0("ST SE (", get_group_var_label(), " = ", GROUP_INTERACTION_REFERENCE, ")") else "ST Std. Error",
+    if (INCLUDE_GROUP_INTERACTIONS) paste0("ST P-value (", get_group_var_label(), " = ", GROUP_INTERACTION_REFERENCE, ")") else "ST P-value",
+    if (INCLUDE_GROUP_INTERACTIONS) paste0("ST Significant (", get_group_var_label(), " = ", GROUP_INTERACTION_REFERENCE, ")") else "ST Significant"
+  ),
+  Model1_ST1 = c(
+    nrow(model1_data),
+    n_distinct(model1_data$repo_git),
+    round(nrow(model1_data) / n_distinct(model1_data$repo_git), 1),
+    round(r2(model1_fe, type = "wr2"), 4),
+    round(r2(model1_fe, type = "ar2"), 4),
+    round(model1_coef, 4),
+    round(model1_se, 4),
+    format.pval(model1_pval, digits = 3, eps = 0.001),
+    ifelse(model1_pval < 0.1, "YES *", "NO")
+  ),
+  Model2_ST2 = c(
+    nrow(model2_data),
+    n_distinct(model2_data$repo_git),
+    round(nrow(model2_data) / n_distinct(model2_data$repo_git), 1),
+    round(r2(model2_fe, type = "wr2"), 4),
+    round(r2(model2_fe, type = "ar2"), 4),
+    round(model2_coef, 4),
+    round(model2_se, 4),
+    format.pval(model2_pval, digits = 3, eps = 0.001),
+    ifelse(model2_pval < 0.1, "YES *", "NO")
+  ),
+  Model3_ST3 = c(
+    nrow(model3_data),
+    n_distinct(model3_data$repo_git),
+    round(nrow(model3_data) / n_distinct(model3_data$repo_git), 1),
+    round(r2(model3_fe, type = "wr2"), 4),
+    round(r2(model3_fe, type = "ar2"), 4),
+    round(model3_coef, 4),
+    round(model3_se, 4),
+    format.pval(model3_pval, digits = 3, eps = 0.001),
+    ifelse(model3_pval < 0.1, "YES *", "NO")
+  )
+)
+
+if (knitr::is_html_output()) {
+  kable(diagnostics_df,
+        col.names = c("Metric", "Model 1: ST1", "Model 2: ST2", "Model 3: ST3"),
+        caption = paste("Diagnostic Statistics Comparison -", TARGET_VARIABLE, "as Dependent Variable"),
+        align = c("l", "r", "r", "r"),
+        format = "html") %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE,
+                  font_size = 12) %>%
+    row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+    row_spec(c(6, 7, 8, 9), background = "#ffffcc") %>%
+    add_header_above(c(" " = 1, "Fixed Effects Panel Regression Models" = 3)) %>%
+    kableExtra::footnote(general = summary_table_note(),
+             general_title = "Note:",
+             footnote_as_chunk = TRUE)
+} else {
+  kable(diagnostics_df,
+        col.names = c("Metric", "Model 1: ST1", "Model 2: ST2", "Model 3: ST3"),
+        caption = paste("Diagnostic Statistics Comparison -", TARGET_VARIABLE, "as Dependent Variable"),
+        align = c("l", "r", "r", "r"))
+}
+
+# Create coefficient plot for ST variables
+cat("\n\n=== COEFFICIENT PLOT: ST METRICS IMPACT ===\n\n")
+
+library(ggplot2)
+
+st_coefs <- bind_rows(
+  model1_effects %>% mutate(Model = "ST1:\nSupplier Coverage"),
+  model2_effects %>% mutate(Model = "ST2:\nDeveloper Coverage"),
+  model3_effects %>% mutate(Model = "ST3:\nEdge Density")
+)
+
+st_coefs <- st_coefs %>%
+  mutate(
+    CI_lower = Estimate - 1.96 * SE,
+    CI_upper = Estimate + 1.96 * SE,
+    Significant = ifelse(PValue < 0.1, "Yes", "No")
+  )
+
+ggplot(st_coefs, aes(x = Model, y = Estimate, color = Significant, shape = Group)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, size = 1,
+                position = position_dodge(width = 0.5)) +
+  scale_color_manual(values = c("No" = "gray60", "Yes" = "#e74c3c")) +
+  labs(
+    title = paste("Impact of Socio-Technical Metrics on", TARGET_VARIABLE),
+    subtitle = ifelse(
+      INCLUDE_GROUP_INTERACTIONS,
+      paste0("Fixed Effects Panel Regression with 95% CI by ", get_group_var_label(), " (ref = ", GROUP_INTERACTION_REFERENCE, ")"),
+      "Fixed Effects Panel Regression with 95% Confidence Intervals"
+    ),
+    x = "Socio-Technical Metric",
+    y = "Coefficient Estimate (Robust SE)",
+    color = "Significant\n(p < 0.1)",
+    shape = get_group_var_label()
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    panel.grid.major.x = element_blank(),
+    legend.position = "right"
+  ) +
+  coord_flip()
+```
+
+## Model Comparison and Summary
+
+```{r}
+cat("\n\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("PANEL REGRESSION MODELS SUMMARY\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+
+cat("DEPENDENT VARIABLE:", TARGET_VARIABLE, "\n")
+if (TARGET_VARIABLE == "velocity") {
+  cat("  - Standardized average of log(commits), log(authors), log(PRs+issues)\n")
+  cat("  - Higher values = more development activity and momentum\n\n")
+} else {
+  cat("  - Description: ", TARGET_VARIABLE, "\n")
+  cat("  - Range: ", round(min(panel_complete[[TARGET_VARIABLE]], na.rm = TRUE), 2), 
+      " to ", round(max(panel_complete[[TARGET_VARIABLE]], na.rm = TRUE), 2), "\n\n")
+}
+
+cat("MODEL SPECIFICATION:\n")
+cat("  - Panel regression with repo-level fixed effects\n")
+cat("  - Robust standard errors (HC1, heteroskedasticity-consistent)\n")
+cat("  - Within-repo variation over time\n")
+cat("  - Controls for time-invariant repo characteristics\n")
+if (INCLUDE_GROUP_INTERACTIONS) {
+  cat("  - Includes ST interactions with", get_group_var_label(), GROUP_INTERACTION_REFERENCE, "as reference\n\n")
+} else {
+  cat("\n")
+}
+
+cat("CONTROL VARIABLES (all models):\n")
+cat("  -", paste(results$control_vars, collapse = ", "), "\n\n")
+
+cat("MODEL RESULTS:\n\n")
+
+cat("Model 1 - ST1 (Supplier Coverage):\n")
+cat("  Observations:", nrow(model1_data), "\n")
+cat("  Repositories:", n_distinct(model1_data$repo_git), "\n")
+cat("  R² (within):", round(r2(model1_fe, type = "wr2"), 4), "\n")
+cat("  ST1", ifelse(INCLUDE_GROUP_INTERACTIONS, paste0("effect (", get_group_var_label(), " = ", GROUP_INTERACTION_REFERENCE, ")"), "coefficient"), ":", round(model1_coef, 4), "\n")
+cat("  ST1 p-value:", round(model1_pval, 4), "\n")
+cat("  Significant:", ifelse(model1_pval < 0.05, "YES ***", "NO"), "\n\n")
+
+cat("Model 2 - ST2 (Developer Coverage):\n")
+cat("  Observations:", nrow(model2_data), "\n")
+cat("  Repositories:", n_distinct(model2_data$repo_git), "\n")
+cat("  R² (within):", round(r2(model2_fe, type = "wr2"), 4), "\n")
+cat("  ST2", ifelse(INCLUDE_GROUP_INTERACTIONS, paste0("effect (", get_group_var_label(), " = ", GROUP_INTERACTION_REFERENCE, ")"), "coefficient"), ":", round(model2_coef, 4), "\n")
+cat("  ST2 p-value:", round(model2_pval, 4), "\n")
+cat("  Significant:", ifelse(model2_pval < 0.05, "YES ***", "NO"), "\n\n")
+
+cat("Model 3 - ST3 (Edge Density):\n")
+cat("  Observations:", nrow(model3_data), "\n")
+cat("  Repositories:", n_distinct(model3_data$repo_git), "\n")
+cat("  R² (within):", round(r2(model3_fe, type = "wr2"), 4), "\n")
+cat("  ST3", ifelse(INCLUDE_GROUP_INTERACTIONS, paste0("effect (", get_group_var_label(), " = ", GROUP_INTERACTION_REFERENCE, ")"), "coefficient"), ":", round(model3_coef, 4), "\n")
+cat("  ST3 p-value:", round(model3_pval, 4), "\n")
+cat("  Significant:", ifelse(model3_pval < 0.05, "YES ***", "NO"), "\n\n")
+
+cat("INTERPRETATION:\n")
+cat("  - Positive coefficient: Higher ST score Ã¢â€ â€™ Higher", TARGET_VARIABLE, "\n")
+cat("  - Negative coefficient: Higher ST score Ã¢â€ â€™ Lower", TARGET_VARIABLE, "\n")
+if (INCLUDE_GROUP_INTERACTIONS) {
+  cat("  - Reported ST coefficients are baseline effects for", get_group_var_label(), GROUP_INTERACTION_REFERENCE, "\n")
+  cat("  - Differences for the other levels are captured by the interaction terms in the model table\n")
+}
+cat("  - Fixed effects control for time-invariant repo characteristics\n")
+cat("  - Results show within-repo changes in ST metrics affecting", TARGET_VARIABLE, "over time\n")
+```
+
+## Save Null Model and Full Comparison Tables
+
+```{r}
+# Construct the output directory (same naming convention as the loop)
+output_dir_single <- sprintf("Results_ST_Window_%s_Lookahead_%d", st_window_label, LOOKAHEAD_MONTHS)
+if (!dir.exists(output_dir_single)) {
+  dir.create(output_dir_single, recursive = TRUE)
+  cat("Created output directory:", output_dir_single, "\n")
+}
+
+target_var_file_stub_single <- gsub("[^A-Za-z0-9_]", "_", TARGET_VARIABLE)
+
+# Save standalone null model table
+null_models_list <- list("Null: Controls Only" = null_model)
+null_table_path <- file.path(output_dir_single,
+  paste0("table_null_", target_var_file_stub_single, ".html"))
+
+modelsummary(
+  null_models_list,
+  stars = c('*' = 0.1, '**' = 0.05, '***' = 0.01),
+  estimate  = "{estimate}{stars} ({std.error})",
+  statistic = NULL,
+  gof_map = c(get_table_gof_map(), "adj.r.squared"),
+  fmt = 4,
+  title = paste("Null Model (Controls Only):", target_var_text),
+  notes = list(
+    "Log-transformed variables. Robust SEs in parentheses.",
+    "Fixed effects: repo_id + month",
+    "No ST variables included — serves as baseline comparison model.",
+    "* p<0.1, ** p<0.05, *** p<0.01"
+  ),
+  output = null_table_path
+)
+cat("Saved null model table:", null_table_path, "\n")
+
+# Save full 4-model comparison (Null + ST1 + ST2 + ST3)
+full_table_path <- file.path(output_dir_single,
+  paste0("table_full_comparison_", target_var_file_stub_single, ".html"))
+
+modelsummary(
+  models_list,   # already contains Null + ST1 + ST2 + ST3 from above
+  stars = c('*' = 0.1, '**' = 0.05, '***' = 0.01),
+  estimate  = "{estimate}{stars} ({std.error})",
+  statistic = NULL,
+  gof_map = c(get_table_gof_map(include_fe = TRUE), "adj.r.squared"),
+  fmt = 4,
+  title = paste("Full Model Comparison (Null + ST Models):", target_var_text),
+  notes = list(
+    "Log-transformed variables. Robust SEs in parentheses.",
+    "Fixed effects: repo_id + month",
+    interaction_note,
+    "* p<0.1, ** p<0.05, *** p<0.01"
+  ),
+  output = full_table_path
+)
+cat("Saved full comparison table:", full_table_path, "\n")
+```
+
+# Loop Through Multiple Target Variables
+
+This section runs the panel regression models for multiple target variables and saves the results (modelsummary table and coefficient plot) to the "Sample Models" subdirectory.
+
+```{r}
+# Output directory encodes both the ST scores window and the look-ahead horizon,
+# e.g. "Results_ST_Window_6_Lookahead_6" or "Results_ST_Window_12_Lookahead_12".
+output_dir <- sprintf("Results_ST_Window_%s_Lookahead_%d", st_window_label, LOOKAHEAD_MONTHS)
+
+# ── Loop controls (Approach 2: data-subset sub-group analysis) ───────────────
+# Set LOOP_FILTER_BY_GROUP <- TRUE to restrict every model in the loop to a
+# single group value.  Choose the grouping variable and the target level:
+#   LOOP_FILTER_VAR  : "cncf_status"      → filter on CNCF maturity stage
+#                      "repo_group_factor" → filter on repo group (100/200/300)
+#   LOOP_GROUP_SUBSET: the exact value to keep (e.g. "graduated", "100")
+LOOP_FILTER_BY_GROUP <- FALSE
+LOOP_FILTER_VAR      <- "cncf_status"   # "cncf_status" or "repo_group_factor"
+LOOP_GROUP_SUBSET    <- "graduated"
+LOOP_INCLUDE_ST3 <- FALSE
+
+if (LOOP_FILTER_BY_GROUP) {
+  subset_stub <- gsub("[^A-Za-z0-9_]+", "_", LOOP_GROUP_SUBSET)
+  var_stub    <- switch(LOOP_FILTER_VAR,
+    "cncf_status"      = "CNCFStatus",
+    "repo_group_factor" = "RepoGroup",
+    gsub("[^A-Za-z0-9_]+", "_", LOOP_FILTER_VAR)
+  )
+  output_dir <- paste0(output_dir, "_", var_stub, "_", subset_stub)
+}
+if (!LOOP_INCLUDE_ST3) {
+  output_dir <- paste0(output_dir, "_NoST3")
+}
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+  cat("Created output directory:", output_dir, "\n")
+}
+
+# Derived targets for the updated concept structure.
+# Use base-R column indexing so that t_plus_n_suffix is evaluated at runtime.
+prs_iss_loop_col            <- paste0("prs_issues_combined", t_plus_n_suffix)
+vel_loop_col                <- paste0("velocity", t_plus_n_suffix)
+resp_closure_ratio_loop_col <- "responsiveness_closure_ratio"
+resp_response_time_loop_col <- "responsiveness_response_time"
+resp_closure_time_loop_col  <- "responsiveness_closure_time"
+
+panel_data[[prs_iss_loop_col]] <-
+  panel_data[[paste0("cumulative_prs_count",   t_plus_n_suffix)]] +
+  panel_data[[paste0("cumulative_issues_count", t_plus_n_suffix)]]
+
+panel_data[[vel_loop_col]] <-
+  (panel_data[[paste0("cumulative_commits_count", t_plus_n_suffix)]] +
+   panel_data[[paste0("cumulative_authors",        t_plus_n_suffix)]] +
+   panel_data[[prs_iss_loop_col]]) / 3
+
+# Composite responsiveness outcomes use the available issue/PR component when
+# the other component is missing; rows with both components missing become NaN
+# and are removed by the target complete-case filter below.
+panel_data[[resp_closure_ratio_loop_col]] <- rowMeans(
+  cbind(
+    panel_data[[paste0("issues_cr_closure_ratio_pct", t_plus_n_suffix)]],
+    panel_data[[paste0("prs_cr_closure_ratio_pct", t_plus_n_suffix)]]
+  ),
+  na.rm = TRUE
+)
+
+panel_data[[resp_response_time_loop_col]] <- rowMeans(
+  cbind(
+    panel_data[[paste0("issues_tfr_mean_hours", t_plus_n_suffix)]],
+    panel_data[[paste0("prs_tfr_mean_hours", t_plus_n_suffix)]]
+  ),
+  na.rm = TRUE
+)
+
+panel_data[[resp_closure_time_loop_col]] <- rowMeans(
+  cbind(
+    panel_data[[paste0("issues_ttc_mean_hours", t_plus_n_suffix)]],
+    panel_data[[paste0("prs_ttc_mean_hours", t_plus_n_suffix)]]
+  ),
+  na.rm = TRUE
+)
+
+USE_INDIVIDUAL_BUS_FACTORS <- TRUE
+
+if (USE_INDIVIDUAL_BUS_FACTORS) {
+  community_targets <- paste0(c("num_commits", "num_contributors", "num_core_contributors", "num_new_contributors",
+                                "bus_factor_comments", "bus_factor_commits", "bus_factor_issues"), t_plus_n_suffix)
+  community_labels <- c("Monthly Commits", "Contributors", "Core Contributors", "New Contributors",
+                        "Comments Bus Factor", "Commits Bus Factor", "Issues Bus Factor")
+  community_control_vars <- c("num_commits_t", "num_contributors_t", "num_core_contributors_t", "num_new_contributors_t",
+                              "bus_factor_comments_t", "bus_factor_commits_t", "bus_factor_issues_t")
+} else {
+  community_targets <- paste0(c("num_commits", "num_contributors", "num_core_contributors", "num_new_contributors",
+                                "bus_factor"), t_plus_n_suffix)
+  community_labels <- c("Monthly Commits", "Contributors", "Core Contributors", "New Contributors", "Overall Bus Factor")
+  community_control_vars <- c("num_commits_t", "num_contributors_t", "num_core_contributors_t", "num_new_contributors_t",
+                              "bus_factor_t")
+}
+
+target_variables_to_test <- c(
+  resp_closure_ratio_loop_col,
+  resp_response_time_loop_col,
+  resp_closure_time_loop_col,
+  paste0(c("issues_tfr_mean_hours", "prs_tfr_mean_hours", "issues_ttc_mean_hours", "prs_ttc_mean_hours"), t_plus_n_suffix),
+  community_targets,
+  paste0(c("cumulative_authors", "cumulative_commits_count", "prs_issues_combined", "velocity"), t_plus_n_suffix)
+)
+
+loop_st_var_keys <- if (LOOP_INCLUDE_ST3) c("ST1", "ST2", "ST3") else c("ST1", "ST2")
+loop_status_var <- if (LOOP_FILTER_BY_GROUP) {
+  resolve_group_var_name(panel_data, LOOP_FILTER_VAR)
+} else {
+  resolve_group_var_name(panel_data, "cncf_status")
+}
+
+st_model_specs <- tibble::tribble(
+  ~key,  ~table_label,                 ~plot_label,                  ~st_var,                    ~result_key,
+  "ST1", "ST1: Supplier Coverage",     "ST1:\nSupplier Coverage",    "st1_supplier_coverage",    "st1",
+  "ST2", "ST2: Developer Coverage",    "ST2:\nDeveloper Coverage",   "st2_developer_coverage",   "st2",
+  "ST3", "ST3: Edge Density",          "ST3:\nEdge Density",         "st3_edge_density",         "st3"
+)
+loop_specs <- st_model_specs %>% filter(key %in% loop_st_var_keys)
+
+# Control variables (base set for all models)
+control_vars_base <- c(
+  "cumulative_stars_t",
+  "cumulative_forks_t",
+  "age_in_months_t",
+  "technical_supplier_count",
+  "social_supplier_count"
+)
+
+concept_map_targets <- c(
+  setNames(rep("Responsiveness", 7),
+           c(resp_closure_ratio_loop_col,
+             resp_response_time_loop_col,
+             resp_closure_time_loop_col,
+             paste0(c("issues_tfr_mean_hours", "prs_tfr_mean_hours", "issues_ttc_mean_hours", "prs_ttc_mean_hours"), t_plus_n_suffix))),
+  setNames(rep("Community", length(community_targets)), community_targets),
+  setNames(rep("Growth", 4),
+           paste0(c("cumulative_authors", "cumulative_commits_count", "prs_issues_combined", "velocity"), t_plus_n_suffix))
+)
+
+target_display_labels <- c(
+  setNames(c("Closure Ratios", "Avg Response Time", "Avg Closure Time", "Issue Response Time", "PR Response Time", "Issue Closure Time", "PR Closure Time"),
+           c(resp_closure_ratio_loop_col,
+             resp_response_time_loop_col,
+             resp_closure_time_loop_col,
+             paste0(c("issues_tfr_mean_hours", "prs_tfr_mean_hours", "issues_ttc_mean_hours", "prs_ttc_mean_hours"), t_plus_n_suffix))),
+  setNames(community_labels, community_targets),
+  setNames(c("Cumulative Authors", "Cumulative Commits", "PRs + Issues Combined", "Velocity"),
+           paste0(c("cumulative_authors", "cumulative_commits_count", "prs_issues_combined", "velocity"), t_plus_n_suffix))
+)
+
+cat("\n\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("RUNNING MODELS FOR MULTIPLE TARGET VARIABLES\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n\n")
+cat("Target variables:", length(target_variables_to_test), "\n")
+cat("Output directory:", output_dir, "\n\n")
+
+# Initialize results collection
+results_summary <- list()
+
+# Loop through each target variable
+for (target_var in target_variables_to_test) {
+  
+  target_var_text <- unname(target_display_labels[target_var])
+  if (is.na(target_var_text) || target_var_text == "") {
+    target_var_text <- gsub("_", " ", gsub(t_plus_n_suffix, "", target_var))
+  }
+  target_var_file_stub <- gsub("[^A-Za-z0-9_]+", "_", gsub(t_plus_n_suffix, "", target_var))
+  
+  # Select controls based on concept to avoid controlling away outcomes
+  concept_for_target <- concept_map_targets[target_var]
+  control_vars_loop <- control_vars_base
+  if (!is.na(concept_for_target) && concept_for_target == "Community") {
+    control_vars_loop <- setdiff(control_vars_loop, community_control_vars)
+  }
+  if (!is.na(concept_for_target) && concept_for_target == "Growth") {
+    control_vars_loop <- setdiff(control_vars_loop, c("cumulative_commits_count_t", "cumulative_authors_t", "cumulative_prs_count_t", "cumulative_issues_count_t", "num_commits_t"))
+  }
+  # Add open issues/PRs count at t as a control for all models
+  if (ADD_OPEN_ISSUES_CONTROL) {
+    if (OPEN_ISSUES_CTRL %in% names(panel_data)) {
+      control_vars_loop <- unique(c(control_vars_loop, OPEN_ISSUES_CTRL))
+    }
+    if (OPEN_PRS_CTRL %in% names(panel_data)) {
+      control_vars_loop <- unique(c(control_vars_loop, OPEN_PRS_CTRL))
+    }
+  }
+  
+  cat("\n", "=" %>% rep(60) %>% paste(collapse = ""), "\n")
+  cat("Processing:", target_var_text, "\n")
+  cat("=" %>% rep(60) %>% paste(collapse = ""), "\n\n")
+  # Check if variable exists
+  if (!target_var %in% names(panel_data)) {
+    cat("  âœ— Variable not found in dataset - SKIPPING\n")
+    next
+  }
+  
+  # Filter complete cases for this target variable
+  panel_complete_loop <- panel_data %>%
+    filter(
+      !is.na(!!sym(target_var)),
+      (!is.na(st1_supplier_coverage) | !is.na(st2_developer_coverage) | !is.na(st3_edge_density))
+    )
+  
+  # Match the standalone model window so the batch summary is comparable.
+  panel_complete_loop <- panel_complete_loop %>%
+    filter(target_month <= as.Date("2026-01-01"))
+
+  # Keep a target-specific base sample before applying controls. Main models
+  # and residualized robustness models use different control sets, so their
+  # complete-case filters are applied separately below.
+  panel_complete_loop_base <- panel_complete_loop
+  
+  # Filter for control variables
+  for (var in control_vars_loop) {
+    if (var %in% names(panel_complete_loop)) {
+      panel_complete_loop <- panel_complete_loop %>%
+        filter(!is.na(!!sym(var)))
+    }
+  }
+  
+  if (LOOP_FILTER_BY_GROUP) {
+    panel_complete_loop <- panel_complete_loop %>%
+      filter(.data[[loop_status_var]] == LOOP_GROUP_SUBSET)
+  }
+  
+  cat("  Complete cases:", nrow(panel_complete_loop), "\n")
+  
+  # Skip if insufficient data
+  if (nrow(panel_complete_loop) < 100) {
+    cat("  âœ— Insufficient data - SKIPPING\n")
+    next
+  }
+  
+  # Build models
+  tryCatch({
+    results_loop <- build_st_models(
+      data = panel_complete_loop,
+      target_var = target_var,
+      control_vars = control_vars_loop,
+      vcov_type = "twoway",
+      fixed_effects = "repo_id + month",
+      use_log = use_log,
+      standardize = STANDARDIZE_VARS,
+      include_group_interactions = INCLUDE_GROUP_INTERACTIONS,
+      group_var = GROUP_INTERACTION_VAR,
+      group_ref = GROUP_INTERACTION_REFERENCE,
+      st_var_keys = loop_st_var_keys
+    )
+    
+    # ------------------------------------------------------------
+    # Residualized ST models
+    # Tests whether the ST component unexplained by conventional
+    # structural controls still predicts outcomes.
+    # ------------------------------------------------------------
+    
+    residual_control_vars_loop <- setdiff(control_vars_loop, residual_excluded_controls)
+    
+    # Re-residualize ST scores for this loop iteration using:
+    #   - the target-specific base sample before main-model control filtering
+    #   - the main-model controls for this target, excluding open issue/PR backlog controls
+    #   - the same two-way FE structure used in these robustness models (repo_id + month)
+    # This ensures FWL consistency per target variable and per subset
+    # (including when LOOP_FILTER_BY_GROUP = TRUE).
+    #
+    # Wrapped in its own tryCatch so that residualization or model-fitting
+    # failures (e.g. sparse clusters when target has many NAs, numerical issues
+    # with raw-scale targets like prs_ttc_mean_hours) do not abort the outer
+    # tryCatch and silently prevent results_summary from being populated.
+    results_loop_resid <- NULL
+    tryCatch({
+      panel_complete_resid_loop <- panel_complete_loop_base
+      
+      for (var in residual_control_vars_loop) {
+        if (var %in% names(panel_complete_resid_loop)) {
+          panel_complete_resid_loop <- panel_complete_resid_loop %>%
+            filter(!is.na(!!sym(var)))
+        }
+      }
+      
+      if (LOOP_FILTER_BY_GROUP) {
+        panel_complete_resid_loop <- panel_complete_resid_loop %>%
+          filter(.data[[loop_status_var]] == LOOP_GROUP_SUBSET)
+      }
+      
+      if (nrow(panel_complete_resid_loop) < 100) {
+        stop("Insufficient complete cases for residualized model.")
+      }
+      
+      panel_complete_resid_loop <- panel_complete_resid_loop %>%
+        mutate(
+          st1_resid = residualize_st_score(
+            data = panel_complete_resid_loop,
+            st_var = "st1_supplier_coverage",
+            residual_controls = residual_control_vars_loop,
+            use_log = use_log
+          ),
+          st2_resid = residualize_st_score(
+            data = panel_complete_resid_loop,
+            st_var = "st2_developer_coverage",
+            residual_controls = residual_control_vars_loop,
+            use_log = use_log
+          ),
+          st3_resid = residualize_st_score(
+            data = panel_complete_resid_loop,
+            st_var = "st3_edge_density",
+            residual_controls = residual_control_vars_loop,
+            use_log = use_log
+          )
+        )
+      results_loop_resid <- build_st_models(
+        data = panel_complete_resid_loop,
+        target_var = target_var,
+        control_vars = residual_control_vars_loop,
+        vcov_type = "twoway",
+        fixed_effects = "repo_id + month",
+        # Residualized ST terms stay unlogged; controls are log-transformed.
+        # This matches the residualized models in 03_sociotechnical_analysis.qmd.
+        use_log = TRUE,
+        standardize = STANDARDIZE_VARS,
+        include_group_interactions = FALSE,
+        st_var_keys = c("ST1_resid", "ST2_resid", "ST3_resid")
+      )
+    }, error = function(e) {
+      cat("    ! Residualized models failed for", target_var, ":", conditionMessage(e), "\n")
+      cat("      (Main model results will still be saved to results_summary.)\n")
+    })
+    
+    active_specs <- loop_specs %>% filter(key %in% names(results_loop$models))
+    
+    # Create models list for modelsummary
+    models_list_loop <- lapply(active_specs$key, function(k) results_loop$models[[k]])
+    names(models_list_loop) <- active_specs$table_label
+    
+    # Save modelsummary as PNG
+    cat("\n  Saving modelsummary table...\n")
+    output_file_table <- file.path(output_dir, paste0("table_", target_var_file_stub, ".html"))
+    
+    ms_table <- modelsummary(
+      models_list_loop,
+      stars = c('*' = 0.1, '**' = 0.05, '***' = 0.01),
+      estimate  = "{estimate}{stars} ({std.error})",
+      statistic = NULL,
+      gof_map = c(get_table_gof_map(), "adj.r.squared"),
+      fmt = 4,
+      title = paste("Panel Regression:", target_var_text),
+      notes = list(
+        "Log-transformed variables. Robust SEs in parentheses.",
+        "Fixed effects: repo_id + month",
+        interaction_note,
+        "* p<0.1, ** p<0.05, *** p<0.01"
+      ),
+      output = output_file_table
+    )
+    
+    cat("  âœ“ Saved:", output_file_table, "\n")
+    
+    # Extract ST effects for plots and summary
+    effects_by_key <- lapply(active_specs$key, function(k) {
+      spec <- active_specs %>% filter(key == k)
+      model_k <- results_loop$models[[k]]
+      effects_k <- extract_st_effects(
+        model_k, spec$st_var[[1]], use_log = use_log,
+        include_group_interactions = INCLUDE_GROUP_INTERACTIONS,
+        group_ref = GROUP_INTERACTION_REFERENCE,
+        standardize = STANDARDIZE_VARS
+      )
+      base_k <- extract_reference_st_main(model_k, spec$st_var[[1]], use_log = use_log, standardize = STANDARDIZE_VARS)
+      list(
+        key = k,
+        plot_label = spec$plot_label[[1]],
+        effects = effects_k,
+        base = base_k,
+        adjr2 = r2(model_k, type = "ar2"),
+        n_obs = nrow(results_loop$data[[k]])
+      )
+    })
+    names(effects_by_key) <- active_specs$key
+    
+    # Create coefficient plot
+    st_coefs_loop <- bind_rows(
+      lapply(effects_by_key, function(x) x$effects %>% mutate(Model = x$plot_label))
+    )
+    
+    st_coefs_loop <- st_coefs_loop %>%
+      mutate(
+        CI_lower = Estimate - 1.96 * SE,
+        CI_upper = Estimate + 1.96 * SE,
+        Significant = ifelse(PValue < 0.1, "Yes", "No")
+      )
+    
+    plot_loop <- ggplot(st_coefs_loop, aes(x = Model, y = Estimate, color = Significant, shape = Group)) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+      geom_point(size = 3, position = position_dodge(width = 0.5)) +
+      geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, size = 1,
+                    position = position_dodge(width = 0.5)) +
+      scale_color_manual(values = c("No" = "gray60", "Yes" = "#e74c3c")) +
+      labs(
+        title = paste("Impact of ST Metrics on", target_var_text),
+        subtitle = ifelse(
+          INCLUDE_GROUP_INTERACTIONS,
+          paste0("Fixed Effects Panel Regression with 95% CI by ", get_group_var_label(), " (ref = ", GROUP_INTERACTION_REFERENCE, ")"),
+          "Fixed Effects Panel Regression with 95% CI (Log-transformed)"
+        ),
+        x = "Socio-Technical Metric",
+        y = "Coefficient Estimate (Robust SE)",
+        color = "Significant\n(p < 0.1)",
+        shape = get_group_var_label()
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        panel.grid.major.x = element_blank(),
+        legend.position = "right"
+      ) +
+      coord_flip()
+    
+    # Save plot as PNG
+    cat("  Saving coefficient plot...\n")
+    output_file_plot <- file.path(output_dir, paste0("plot_", target_var_file_stub, ".png"))
+    ggsave(output_file_plot, plot = plot_loop, width = 10, height = 6, dpi = 300)
+    cat("  Saved:", output_file_plot, "\n")
+    
+    # Store results for summary table
+    get_result_entry <- function(k) {
+      if (!k %in% names(effects_by_key)) return(NA_character_)
+      base <- effects_by_key[[k]]$base
+      if (is.null(base) || is.na(base$Estimate)) return(NA_character_)
+      format_st_result(
+        base$Estimate,
+        base$SE,
+        base$PValue,
+        effects_by_key[[k]]$adjr2
+      )
+    }
+    
+    get_result_entry_resid <- function(k) {
+      tryCatch({
+        if (!k %in% names(results_loop_resid$models)) return(NA_character_)
+        model_k  <- results_loop_resid$models[[k]]
+        st_var_k <- switch(k,
+          ST1_resid = "st1_resid",
+          ST2_resid = "st2_resid",
+          ST3_resid = "st3_resid"
+        )
+        effects_k <- extract_st_effects(
+          model_k,
+          st_var = st_var_k,
+          use_log = FALSE,
+          include_group_interactions = FALSE,
+          standardize = STANDARDIZE_VARS
+        )
+        if (nrow(effects_k) == 0) return(NA_character_)
+        format_st_result(
+          effects_k$Estimate[1],
+          effects_k$SE[1],
+          effects_k$PValue[1],
+          r2(model_k, type = "ar2")
+        )
+      }, error = function(e) {
+        cat("    ! get_result_entry_resid(", k, ") failed:", conditionMessage(e), "\n")
+        NA_character_
+      })
+    }
+    
+    # Helper: extract a supplier count coefficient from one ST model
+    get_ctrl_coef_result <- function(k, ctrl_var) {
+      if (!k %in% names(results_loop$models)) return(NA_character_)
+      model_k    <- results_loop$models[[k]]
+      coef_label <- get_control_coef_name(ctrl_var, use_log = use_log, standardize = STANDARDIZE_VARS)
+      info       <- extract_named_coef(model_k, coef_label)
+      if (is.na(info$est)) return(NA_character_)
+      adjr2_k <- tryCatch(unname(r2(model_k, type = "ar2")), error = function(e) NA_real_)
+      format_st_result(info$est, info$se, info$pval, adjr2_k)
+    }
+    
+    results_summary[[target_var]] <- list(
+      target   = target_var,
+      st1      = get_result_entry("ST1"),
+      st2      = get_result_entry("ST2"),
+      st3      = get_result_entry("ST3"),
+      st1_resid = get_result_entry_resid("ST1_resid"),
+      st2_resid = get_result_entry_resid("ST2_resid"),
+      st3_resid = get_result_entry_resid("ST3_resid"),
+      n_obs    = unname(unlist(lapply(effects_by_key, function(x) x$n_obs))),
+      # Use a safe pull that returns NA_real_ when the ST key was not modelled
+      # (e.g. ST3 is excluded when LOOP_INCLUDE_ST3 = FALSE). A bare pull() in
+      # that case returns numeric(0), which breaks purrr::map_dfr's tibble
+      # construction with a column-length mismatch error.
+      st1_delta_wr2 = { v <- results_loop$model_comparison %>% filter(model_name == "ST1") %>% pull(delta_wr2); if (length(v) == 0L) NA_real_ else v[[1L]] },
+      st2_delta_wr2 = { v <- results_loop$model_comparison %>% filter(model_name == "ST2") %>% pull(delta_wr2); if (length(v) == 0L) NA_real_ else v[[1L]] },
+      st3_delta_wr2 = { v <- results_loop$model_comparison %>% filter(model_name == "ST3") %>% pull(delta_wr2); if (length(v) == 0L) NA_real_ else v[[1L]] },
+      st1_tech = get_ctrl_coef_result("ST1", "technical_supplier_count"),
+      st1_soc  = get_ctrl_coef_result("ST1", "social_supplier_count"),
+      st2_tech = get_ctrl_coef_result("ST2", "technical_supplier_count"),
+      st2_soc  = get_ctrl_coef_result("ST2", "social_supplier_count"),
+      st3_tech = get_ctrl_coef_result("ST3", "technical_supplier_count"),
+      st3_soc  = get_ctrl_coef_result("ST3", "social_supplier_count")
+    )
+    
+    cat("  âœ“ Completed:", target_var, "\n")
+    
+  }, error = function(e) {
+    cat("  âœ— ERROR:", conditionMessage(e), "\n")
+  })
+}
+
+cat("\n\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("BATCH PROCESSING COMPLETE\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("All results saved to:", output_dir, "\n")
+```
+
+## Results Summary: All Target Variables
+
+```{r}
+# Create summary table of all results
+if (length(results_summary) > 0) {
+  
+  concept_order <- c("Responsiveness", "Community", "Growth")
+  target_vector <- sapply(results_summary, function(x) x$target)
+  summary_df <- data.frame(
+    Target_Variable = target_vector,
+    Concept = concept_map_targets[target_vector],
+    ST1_Supplier_Coverage = sapply(results_summary, function(x) x$st1),
+    ST2_Developer_Coverage = sapply(results_summary, function(x) x$st2),
+    stringsAsFactors = FALSE
+  )
+  if (LOOP_INCLUDE_ST3) {
+    summary_df$ST3_Edge_Density <- sapply(results_summary, function(x) x$st3)
+  }
+  
+  summary_df$Target_Variable <- unname(target_display_labels[summary_df$Target_Variable])
+  missing_labels <- is.na(summary_df$Target_Variable)
+  summary_df$Target_Variable[missing_labels] <- gsub(
+    "_", " ", gsub(t_plus_n_suffix, "", target_vector[missing_labels])
+  )
+  target_order_labels <- unname(target_display_labels[target_variables_to_test])
+  missing_target_order_labels <- is.na(target_order_labels)
+  target_order_labels[missing_target_order_labels] <- gsub(
+    "_", " ", gsub(t_plus_n_suffix, "", target_variables_to_test[missing_target_order_labels])
+  )
+  summary_df$Concept <- factor(summary_df$Concept, levels = concept_order)
+  summary_df$Target_Variable <- factor(
+    summary_df$Target_Variable,
+    levels = unique(target_order_labels)
+  )
+  summary_df <- summary_df[order(summary_df$Concept, summary_df$Target_Variable), ]
+  
+  concept_counts <- summary_df %>% count(Concept)
+
+  summary_cols <- c("Target_Variable", "ST1_Supplier_Coverage", "ST2_Developer_Coverage")
+  summary_col_names <- c("Target Variable", "ST1: Supplier Coverage", "ST2: Developer Coverage")
+  if (LOOP_INCLUDE_ST3) {
+    summary_cols <- c(summary_cols, "ST3_Edge_Density")
+    summary_col_names <- c(summary_col_names, "ST3: Edge Density")
+  }
+  
+  html_table <- kable(summary_df %>% select(all_of(summary_cols)),
+        col.names = summary_col_names,
+        caption = "Panel Regression Results Summary: Log-Transformed Variables",
+        align = c("l", rep("c", length(summary_cols) - 1)),
+        format = "html",
+        row.names = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE,
+                  font_size = 12) %>%
+    row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+    add_header_above(c(" " = 1, "Socio-Technical Metrics (Log-Transformed)" = length(summary_cols) - 1)) %>%
+    kableExtra::footnote(general = summary_table_note(),
+             general_title = "Note:",
+             footnote_as_chunk = TRUE)
+  row_start <- 1
+  for (i in seq_len(nrow(concept_counts))) {
+    row_end <- row_start + concept_counts$n[i] - 1
+    html_table <- html_table %>% pack_rows(as.character(concept_counts$Concept[i]), row_start, row_end)
+    row_start <- row_end + 1
+  }
+
+  save_kable(html_table, file.path(output_dir, "summary_table_all_targets.html"))
+  cat("Saved:", file.path(output_dir, "summary_table_all_targets.html"), "\n")
+
+  if (knitr::is_html_output()) {
+    html_table
+  } else {
+    text_cols <- c("Concept", summary_cols)
+    text_col_names <- c("Concept", summary_col_names)
+    kable(summary_df %>% select(all_of(text_cols)),
+          col.names = text_col_names,
+          caption = "Panel Regression Results Summary: Log-Transformed Variables",
+          align = c("l", "l", rep("c", length(summary_cols) - 1)),
+          row.names = FALSE)
+  }
+}
+```
+
+## Condensed Results Summary
+
+```{r condensed-summary-table}
+# ── Short-form table: selected targets with remapped concept groupings ────────
+# Rows included and their display labels (order preserved as specified)
+short_form_targets <- list(
+  list(col = paste0("issues_tfr_mean_hours",      t_plus_n_suffix), label = "Issue TFR"),
+  list(col = paste0("prs_tfr_mean_hours",          t_plus_n_suffix), label = "PR TFR"),
+  list(col = paste0("issues_ttc_mean_hours",       t_plus_n_suffix), label = "Issue TTC"),
+  list(col = paste0("prs_ttc_mean_hours",          t_plus_n_suffix), label = "PR TTC"),
+  list(col = paste0("num_core_contributors",       t_plus_n_suffix), label = "Core Contributors"),
+  list(col = paste0("num_new_contributors",        t_plus_n_suffix), label = "New Contributors"),
+  list(col = paste0("cumulative_authors",          t_plus_n_suffix), label = "Cumulative Authors"),
+  list(col = paste0("cumulative_commits_count",    t_plus_n_suffix), label = "Cumulative Commits"),
+  list(col = paste0("prs_issues_combined",         t_plus_n_suffix), label = "PRs + Issues Combined"),
+  list(col = paste0("velocity",                    t_plus_n_suffix), label = "Velocity")
+)
+
+short_concept_map <- c(
+  setNames(rep("Responsiveness",        4),
+           sapply(short_form_targets[1:4],  `[[`, "col")),
+  setNames(rep("Contributor Engagement", 3),
+           sapply(short_form_targets[5:7],  `[[`, "col")),
+  setNames(rep("Knowledge Production",   3),
+           sapply(short_form_targets[8:10], `[[`, "col"))
+)
+short_concept_order <- c("Responsiveness", "Contributor Engagement", "Knowledge Production")
+
+if (length(results_summary) > 0) {
+  short_cols      <- sapply(short_form_targets, `[[`, "col")
+  short_labels_v  <- sapply(short_form_targets, `[[`, "label")
+
+  # Keep only rows that were actually modelled
+  available_short <- short_cols[short_cols %in% names(results_summary)]
+  if (length(available_short) == 0) {
+    cat("No condensed-table targets found in results_summary — skipping.\n")
+  } else {
+    short_df <- data.frame(
+      Target_Variable        = available_short,
+      Concept                = short_concept_map[available_short],
+      ST1_Supplier_Coverage  = sapply(results_summary[available_short], function(x) x$st1),
+      ST2_Developer_Coverage = sapply(results_summary[available_short], function(x) x$st2),
+      stringsAsFactors       = FALSE
+    )
+    if (LOOP_INCLUDE_ST3) {
+      short_df$ST3_Edge_Density <- sapply(results_summary[available_short], function(x) x$st3)
+    }
+
+    # Apply display labels in the specified order
+    label_lookup <- setNames(short_labels_v, short_cols)
+    short_df$Target_Variable <- unname(label_lookup[short_df$Target_Variable])
+
+    short_df$Concept         <- factor(short_df$Concept,         levels = short_concept_order)
+    short_df$Target_Variable <- factor(short_df$Target_Variable, levels = short_labels_v)
+    short_df <- short_df[order(short_df$Concept, short_df$Target_Variable), ]
+
+    concept_counts_short <- short_df %>% count(Concept)
+
+    short_cols_sel  <- c("Target_Variable", "ST1_Supplier_Coverage", "ST2_Developer_Coverage")
+    short_col_names <- c("Target Variable",  "ST1: Supplier Coverage", "ST2: Developer Coverage")
+    if (LOOP_INCLUDE_ST3) {
+      short_cols_sel  <- c(short_cols_sel,  "ST3_Edge_Density")
+      short_col_names <- c(short_col_names, "ST3: Edge Density")
+    }
+    n_st_cols <- length(short_col_names) - 1L  # number of ST metric columns
+
+    short_html <- kable(
+        short_df %>% select(all_of(short_cols_sel)),
+        col.names   = short_col_names,
+        caption     = "Panel Regression Results (Selected Variables)",
+        align       = c("l", rep("c", n_st_cols)),
+        format      = "html",
+        row.names   = FALSE
+      ) %>%
+      kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed"),
+        full_width        = FALSE,
+        font_size         = 12
+      ) %>%
+      row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+      add_header_above(c(" " = 1, "Socio-Technical Metrics (Log-Transformed)" = n_st_cols)) %>%
+      kableExtra::footnote(
+        general       = summary_table_note(),
+        general_title = "Note:",
+        footnote_as_chunk = TRUE
+      )
+
+    row_start <- 1
+    for (i in seq_len(nrow(concept_counts_short))) {
+      row_end   <- row_start + concept_counts_short$n[i] - 1
+      short_html <- short_html %>%
+        pack_rows(as.character(concept_counts_short$Concept[i]), row_start, row_end)
+      row_start <- row_end + 1
+    }
+
+    short_html_path <- file.path(output_dir, "summary_table_condensed.html")
+    save_kable(short_html, short_html_path)
+    cat("Saved:", short_html_path, "\n")
+
+    if (knitr::is_html_output()) {
+      short_html
+    } else {
+      kable(
+        short_df %>% select(Concept, all_of(short_cols_sel)),
+        col.names   = c("Concept", short_col_names),
+        caption     = "Panel Regression Results (Selected Variables)",
+        align       = c("l", "l", rep("c", n_st_cols)),
+        row.names   = FALSE
+      )
+    }
+  }
+}
+
+# ------------------------------------------------------------
+# Summary table: Incremental explanatory power and residualized ST results
+# ------------------------------------------------------------
+
+extract_sig_marker <- function(x) {
+  if (is.na(x) || length(x) == 0) return("")
+  case_when(
+    str_detect(x, "\\*\\*\\*") ~ "***",
+    str_detect(x, "\\*\\*") ~ "**",
+    str_detect(x, "\\*") ~ "*",
+    TRUE ~ ""
+  )
+}
+
+st_incremental_summary <- purrr::map_dfr(results_summary, function(x) {
+  tibble(
+    outcome = x$target,
+
+    st1_delta_wr2 = x$st1_delta_wr2,
+    st2_delta_wr2 = x$st2_delta_wr2,
+    st3_delta_wr2 = x$st3_delta_wr2,
+
+    st1_resid_sig = extract_sig_marker(x$st1_resid),
+    st2_resid_sig = extract_sig_marker(x$st2_resid),
+    st3_resid_sig = extract_sig_marker(x$st3_resid),
+
+    st1_main = x$st1,
+    st2_main = x$st2,
+    st3_main = x$st3,
+
+    st1_resid = x$st1_resid,
+    st2_resid = x$st2_resid,
+    st3_resid = x$st3_resid
+  )
+})
+
+# Optional: nicer ordering / formatting
+st_incremental_summary <- st_incremental_summary %>%
+  mutate(
+    across(
+      c(st1_delta_wr2, st2_delta_wr2, st3_delta_wr2),
+      ~ round(.x, 4)
+    )
+  )
+
+print(st_incremental_summary)
+
+# Save as CSV
+write_csv(
+  st_incremental_summary,
+  file.path(output_dir, "st_incremental_residualized_summary.csv")
+)
+
+# Save as RDS for later use
+saveRDS(
+  st_incremental_summary,
+  file.path(output_dir, "st_incremental_residualized_summary.rds")
+)
+
+st_incremental_summary_ft <- st_incremental_summary %>%
+  select(
+    outcome,
+    st1_delta_wr2,
+    st2_delta_wr2,
+    st3_delta_wr2,
+    st1_resid_sig,
+    st2_resid_sig,
+    st3_resid_sig
+  ) %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(
+    outcome = "Outcome",
+    st1_delta_wr2 = "ST1 Δ Within R²",
+    st2_delta_wr2 = "ST2 Δ Within R²",
+    st3_delta_wr2 = "ST3 Δ Within R²",
+    st1_resid_sig = "ST1 Residual Sig.",
+    st2_resid_sig = "ST2 Residual Sig.",
+    st3_resid_sig = "ST3 Residual Sig."
+  ) %>%
+  flextable::autofit()
+
+flextable::save_as_docx(
+  st_incremental_summary_ft,
+  path = file.path(output_dir, "st_incremental_residualized_summary.docx")
+)
+```
+
+## Out-of-Sample R2: Repo-Held-Out TWFE
+
+```{r}
+# Repo-held-out OOS R2 for the same target/model setup used above.
+# Prediction is on the held-out repo-demeaned scale and includes the
+# training-estimated month fixed effects centered within the held-out repo.
+
+OOS_BOOTSTRAP_REPS <- 1000
+OOS_BOOTSTRAP_SEED <- 20260530
+
+get_loop_controls_for_target <- function(target_var) {
+  concept_for_target <- concept_map_targets[target_var]
+  controls <- control_vars_base
+
+  if (!is.na(concept_for_target) && concept_for_target == "Community") {
+    controls <- setdiff(controls, community_control_vars)
+  }
+
+  if (!is.na(concept_for_target) && concept_for_target == "Growth") {
+    controls <- setdiff(
+      controls,
+      c(
+        "cumulative_commits_count_t",
+        "cumulative_authors_t",
+        "cumulative_prs_count_t",
+        "cumulative_issues_count_t",
+        "num_commits_t"
+      )
+    )
+  }
+
+  if (ADD_OPEN_ISSUES_CONTROL) {
+    if (OPEN_ISSUES_CTRL %in% names(panel_data)) {
+      controls <- unique(c(controls, OPEN_ISSUES_CTRL))
+    }
+    if (OPEN_PRS_CTRL %in% names(panel_data)) {
+      controls <- unique(c(controls, OPEN_PRS_CTRL))
+    }
+  }
+
+  controls
+}
+
+drop_entity_invariant_controls <- function(data, control_vars, entity_var = "repo_id") {
+  if (!entity_var %in% names(data)) return(control_vars)
+
+  invariant_controls <- c()
+
+  for (ctrl in control_vars) {
+    if (ctrl %in% names(data)) {
+      variation_check <- data %>%
+        group_by(.data[[entity_var]]) %>%
+        summarise(n_vals = n_distinct(.data[[ctrl]], na.rm = TRUE), .groups = "drop")
+
+      if (all(variation_check$n_vals <= 1, na.rm = TRUE)) {
+        invariant_controls <- c(invariant_controls, ctrl)
+      }
+    }
+  }
+
+  setdiff(control_vars, invariant_controls)
+}
+
+prepare_oos_model_df <- function(data,
+                                 target_var,
+                                 st_var,
+                                 control_vars,
+                                 entity_var = "repo_id",
+                                 time_var = "month") {
+  required_vars <- unique(c(target_var, st_var, control_vars, entity_var, time_var, "target_month"))
+  required_vars <- required_vars[required_vars %in% names(data)]
+
+  model_df <- data %>%
+    filter(
+      !is.na(.data[[target_var]]),
+      !is.na(.data[[st_var]])
+    )
+
+  if ("target_month" %in% names(model_df)) {
+    model_df <- model_df %>%
+      filter(target_month <= as.Date("2026-01-01"))
+  }
+
+  if (LOOP_FILTER_BY_GROUP) {
+    model_df <- model_df %>%
+      filter(.data[[loop_status_var]] == LOOP_GROUP_SUBSET)
+  }
+
+  model_df %>%
+    select(all_of(required_vars)) %>%
+    drop_na() %>%
+    filter(
+      is.finite(log1p(.data[[target_var]])),
+      if_all(all_of(c(st_var, control_vars)), ~ is.finite(log1p(.x)))
+    )
+}
+
+make_log_rhs <- function(vars, fixed_effects = "repo_id + month") {
+  vars <- vars[nzchar(vars)]
+  if (length(vars) == 0L) {
+    paste0("1 | ", fixed_effects)
+  } else {
+    paste0(
+      paste(paste0("log1p(", vars, ")"), collapse = " + "),
+      " | ",
+      fixed_effects
+    )
+  }
+}
+
+oos_repo_holdout_twfe_components <- function(data,
+                                             target_var,
+                                             rhs_vars,
+                                             entity_var = "repo_id",
+                                             time_var = "month") {
+  repos <- sort(unique(data[[entity_var]]))
+  rhs_vars <- rhs_vars[rhs_vars %in% names(data)]
+
+  if (length(repos) < 3L) return(tibble())
+
+  full_formula <- as.formula(
+    paste0("log1p(", target_var, ") ~ ", make_log_rhs(rhs_vars))
+  )
+
+  repo_components <- vector("list", length(repos))
+
+  for (repo_idx in seq_along(repos)) {
+    repo <- repos[[repo_idx]]
+    train_data <- data[data[[entity_var]] != repo, , drop = FALSE]
+    test_data <- data[data[[entity_var]] == repo, , drop = FALSE]
+
+    if (nrow(test_data) < 2L) next
+
+    model <- tryCatch(
+      feols(full_formula, data = train_data, vcov = "iid"),
+      error = function(e) NULL
+    )
+    if (is.null(model)) next
+
+    beta_names <- paste0("log1p(", rhs_vars, ")")
+    beta <- tryCatch(coef(model)[beta_names], error = function(e) NULL)
+    if (length(rhs_vars) > 0L && (is.null(beta) || anyNA(beta))) next
+
+    y_raw <- log1p(test_data[[target_var]])
+
+    if (length(rhs_vars) > 0L) {
+      X_raw <- vapply(
+        setNames(rhs_vars, beta_names),
+        function(v) log1p(test_data[[v]]),
+        numeric(nrow(test_data))
+      )
+      if (!is.matrix(X_raw)) {
+        X_raw <- matrix(X_raw, nrow = nrow(test_data), dimnames = list(NULL, beta_names))
+      }
+      valid <- is.finite(y_raw) & rowSums(!is.finite(X_raw)) == 0L
+    } else {
+      X_raw <- matrix(nrow = nrow(test_data), ncol = 0L)
+      valid <- is.finite(y_raw)
+    }
+
+    if (sum(valid) < 2L) next
+
+    y_test <- y_raw[valid]
+    X_test <- X_raw[valid, , drop = FALSE]
+    time_test <- test_data[[time_var]][valid]
+
+    time_fe <- tryCatch(fixef(model)[[time_var]], error = function(e) NULL)
+    time_hat <- rep(0, length(y_test))
+
+    if (!is.null(time_fe)) {
+      time_hat <- unname(time_fe[as.character(time_test)])
+      valid_time <- is.finite(time_hat)
+
+      if (sum(valid_time) < 2L) next
+
+      y_test <- y_test[valid_time]
+      X_test <- X_test[valid_time, , drop = FALSE]
+      time_hat <- time_hat[valid_time]
+    }
+
+    y_dm <- y_test - mean(y_test)
+    time_dm <- time_hat - mean(time_hat)
+
+    if (length(rhs_vars) > 0L) {
+      X_dm <- sweep(X_test, 2L, colMeans(X_test), "-")
+      ypred_dm <- as.vector(X_dm %*% beta) + time_dm
+    } else {
+      ypred_dm <- time_dm
+    }
+
+    e <- y_dm - ypred_dm
+
+    repo_components[[repo_idx]] <- tibble(
+      repo = repo,
+      e2_sum = sum(e^2),
+      ydm2_sum = sum(y_dm^2),
+      n_holdout = length(e)
+    )
+  }
+
+  bind_rows(repo_components)
+}
+
+oos_r2_from_components <- function(components) {
+  if (nrow(components) == 0L || sum(components$ydm2_sum, na.rm = TRUE) == 0) {
+    return(NA_real_)
+  }
+
+  1 - sum(components$e2_sum, na.rm = TRUE) / sum(components$ydm2_sum, na.rm = TRUE)
+}
+
+oos_r2_repo_holdout_twfe <- function(data,
+                                     target_var,
+                                     rhs_vars,
+                                     entity_var = "repo_id",
+                                     time_var = "month") {
+  components <- oos_repo_holdout_twfe_components(
+    data = data,
+    target_var = target_var,
+    rhs_vars = rhs_vars,
+    entity_var = entity_var,
+    time_var = time_var
+  )
+
+  oos_r2_from_components(components)
+}
+
+bootstrap_oos_delta_r2 <- function(null_components,
+                                   st_components,
+                                   n_boot = OOS_BOOTSTRAP_REPS) {
+  empty_bootstrap_result <- tibble(
+    oos_r2_null = NA_real_,
+    oos_r2_st = NA_real_,
+    delta_oos_r2 = NA_real_,
+    delta_oos_r2_mean = NA_real_,
+    delta_oos_r2_ci_low = NA_real_,
+    delta_oos_r2_ci_high = NA_real_
+  )
+
+  if (nrow(null_components) == 0L || nrow(st_components) == 0L) {
+    return(empty_bootstrap_result)
+  }
+
+  paired_components <- null_components %>%
+    select(repo, null_e2_sum = e2_sum, null_ydm2_sum = ydm2_sum) %>%
+    inner_join(
+      st_components %>%
+        select(repo, st_e2_sum = e2_sum, st_ydm2_sum = ydm2_sum),
+      by = "repo"
+    )
+
+  if (nrow(paired_components) < 3L) {
+    return(empty_bootstrap_result)
+  }
+
+  if (sum(paired_components$null_ydm2_sum) == 0 ||
+      sum(paired_components$st_ydm2_sum) == 0) {
+    return(empty_bootstrap_result)
+  }
+
+  observed_null <- 1 - sum(paired_components$null_e2_sum) / sum(paired_components$null_ydm2_sum)
+  observed_st <- 1 - sum(paired_components$st_e2_sum) / sum(paired_components$st_ydm2_sum)
+  observed_delta <- observed_st - observed_null
+
+  boot_delta <- replicate(n_boot, {
+    boot_idx <- sample.int(nrow(paired_components), replace = TRUE)
+    boot_df <- paired_components[boot_idx, , drop = FALSE]
+
+    if (sum(boot_df$null_ydm2_sum) == 0 || sum(boot_df$st_ydm2_sum) == 0) {
+      return(NA_real_)
+    }
+
+    boot_null <- 1 - sum(boot_df$null_e2_sum) / sum(boot_df$null_ydm2_sum)
+    boot_st <- 1 - sum(boot_df$st_e2_sum) / sum(boot_df$st_ydm2_sum)
+
+    boot_st - boot_null
+  })
+
+  tibble(
+    oos_r2_null = observed_null,
+    oos_r2_st = observed_st,
+    delta_oos_r2 = observed_delta,
+    delta_oos_r2_mean = mean(boot_delta, na.rm = TRUE),
+    delta_oos_r2_ci_low = unname(quantile(boot_delta, 0.025, na.rm = TRUE)),
+    delta_oos_r2_ci_high = unname(quantile(boot_delta, 0.975, na.rm = TRUE))
+  )
+}
+
+compute_oos_r2_for_target_model <- function(target_var, spec) {
+  model_key <- as.character(spec$key[[1]])
+  st_var <- as.character(spec$st_var[[1]])
+
+  if (!(target_var %in% names(panel_data)) || !(st_var %in% names(panel_data))) {
+    return(tibble(
+      outcome = target_var,
+      model = model_key,
+      n_obs = NA_integer_,
+      n_repo = NA_integer_,
+      n_month = NA_integer_,
+      oos_r2_null = NA_real_,
+      oos_r2_st = NA_real_,
+      delta_oos_r2 = NA_real_,
+      delta_oos_r2_mean = NA_real_,
+      delta_oos_r2_ci_low = NA_real_,
+      delta_oos_r2_ci_high = NA_real_
+    ))
+  }
+
+  controls <- get_loop_controls_for_target(target_var)
+  controls <- drop_entity_invariant_controls(panel_data, controls)
+  controls <- controls[controls %in% names(panel_data)]
+
+  model_df <- prepare_oos_model_df(
+    data = panel_data,
+    target_var = target_var,
+    st_var = st_var,
+    control_vars = controls
+  )
+
+  if (nrow(model_df) < 100L) {
+    return(tibble(
+      outcome = target_var,
+      model = model_key,
+      n_obs = nrow(model_df),
+      n_repo = n_distinct(model_df$repo_id),
+      n_month = n_distinct(model_df$month),
+      oos_r2_null = NA_real_,
+      oos_r2_st = NA_real_,
+      delta_oos_r2 = NA_real_,
+      delta_oos_r2_mean = NA_real_,
+      delta_oos_r2_ci_low = NA_real_,
+      delta_oos_r2_ci_high = NA_real_
+    ))
+  }
+
+  null_components <- oos_repo_holdout_twfe_components(
+    data = model_df,
+    target_var = target_var,
+    rhs_vars = controls
+  )
+
+  st_components <- oos_repo_holdout_twfe_components(
+    data = model_df,
+    target_var = target_var,
+    rhs_vars = c(st_var, controls)
+  )
+
+  oos_boot <- bootstrap_oos_delta_r2(
+    null_components = null_components,
+    st_components = st_components
+  )
+
+  tibble(
+    outcome = target_var,
+    model = model_key,
+    n_obs = nrow(model_df),
+    n_repo = n_distinct(model_df$repo_id),
+    n_month = n_distinct(model_df$month)
+  ) %>%
+    bind_cols(oos_boot)
+}
+
+message("Computing repo-held-out OOS R2 for socio-technical models ...")
+set.seed(OOS_BOOTSTRAP_SEED)
+
+st_oos_r2_summary <- purrr::map_dfr(target_variables_to_test, function(target_var) {
+  message("  Target: ", target_var)
+  purrr::map_dfr(seq_len(nrow(loop_specs)), function(i) {
+    compute_oos_r2_for_target_model(target_var, loop_specs[i, ])
+  })
+})
+
+st_oos_r2_summary_display <- st_oos_r2_summary %>%
+  mutate(
+    outcome_label = unname(target_display_labels[outcome]),
+    outcome_label = if_else(
+      is.na(outcome_label) | outcome_label == "",
+      gsub("_", " ", gsub(t_plus_n_suffix, "", outcome)),
+      outcome_label
+    ),
+    across(
+      c(
+        oos_r2_null,
+        oos_r2_st,
+        delta_oos_r2,
+        delta_oos_r2_mean,
+        delta_oos_r2_ci_low,
+        delta_oos_r2_ci_high
+      ),
+      ~ round(.x, 4)
+    )
+  ) %>%
+  select(outcome, outcome_label, model, n_obs, n_repo, n_month,
+         oos_r2_null, oos_r2_st, delta_oos_r2,
+         delta_oos_r2_mean, delta_oos_r2_ci_low, delta_oos_r2_ci_high)
+
+print(st_oos_r2_summary_display)
+
+write_csv(
+  st_oos_r2_summary,
+  file.path(output_dir, "st_oos_r2_repo_holdout_summary.csv")
+)
+
+saveRDS(
+  st_oos_r2_summary,
+  file.path(output_dir, "st_oos_r2_repo_holdout_summary.rds")
+)
+
+st_oos_r2_summary_ft <- st_oos_r2_summary_display %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(
+    outcome = "Outcome",
+    outcome_label = "Outcome Label",
+    model = "Model",
+    n_obs = "N",
+    n_repo = "Repos",
+    n_month = "Months",
+    oos_r2_null = "Null OOS R2",
+    oos_r2_st = "ST OOS R2",
+    delta_oos_r2 = "Observed Delta OOS R2",
+    delta_oos_r2_mean = "Mean Delta OOS R2",
+    delta_oos_r2_ci_low = "95% CI Low",
+    delta_oos_r2_ci_high = "95% CI High"
+  ) %>%
+  flextable::set_caption("Repo-held-out OOS R2 with repo demeaning and centered training month FE") %>%
+  flextable::autofit()
+
+st_oos_r2_summary_ft
+
+flextable::save_as_docx(
+  st_oos_r2_summary_ft,
+  path = file.path(output_dir, "st_oos_r2_repo_holdout_summary.docx")
+)
+
+st_oos_r2_wide <- st_oos_r2_summary %>%
+  select(
+    outcome,
+    model,
+    oos_r2_null,
+    oos_r2_st,
+    delta_oos_r2,
+    delta_oos_r2_mean,
+    delta_oos_r2_ci_low,
+    delta_oos_r2_ci_high
+  ) %>%
+  pivot_wider(
+    names_from = model,
+    values_from = c(
+      oos_r2_st,
+      delta_oos_r2,
+      delta_oos_r2_mean,
+      delta_oos_r2_ci_low,
+      delta_oos_r2_ci_high
+    ),
+    names_glue = "{model}_{.value}"
+  )
+
+st_oos_r2_wide_display <- st_oos_r2_wide %>%
+  mutate(
+    outcome_label = unname(target_display_labels[outcome]),
+    outcome_label = if_else(
+      is.na(outcome_label) | outcome_label == "",
+      gsub("_", " ", gsub(t_plus_n_suffix, "", outcome)),
+      outcome_label
+    ),
+    across(where(is.numeric), ~ round(.x, 4))
+  ) %>%
+  relocate(outcome_label, .after = outcome)
+
+print(st_oos_r2_wide_display)
+
+write_csv(
+  st_oos_r2_wide,
+  file.path(output_dir, "st_oos_r2_repo_holdout_summary_wide.csv")
+)
+
+# Condensed publication-style table matching the within-R2 summary structure.
+format_oos_delta_ci <- function(mean_delta, ci_low, ci_high, digits = 4) {
+  ifelse(
+    is.na(mean_delta) | is.na(ci_low) | is.na(ci_high),
+    "",
+    sprintf(
+      paste0("%.", digits, "f (%.", digits, "f, %.", digits, "f)"),
+      mean_delta,
+      ci_low,
+      ci_high
+    )
+  )
+}
+
+short_oos_cols <- sapply(short_form_targets, `[[`, "col")
+short_oos_labels <- sapply(short_form_targets, `[[`, "label")
+available_short_oos <- short_oos_cols[short_oos_cols %in% st_oos_r2_summary$outcome]
+
+if (length(available_short_oos) == 0) {
+  cat("No condensed-table targets found in st_oos_r2_summary - skipping condensed OOS R2 table.\n")
+} else {
+  st_oos_r2_condensed <- st_oos_r2_summary %>%
+    filter(outcome %in% available_short_oos) %>%
+    mutate(
+      delta_oos_r2_ci = format_oos_delta_ci(
+        delta_oos_r2_mean,
+        delta_oos_r2_ci_low,
+        delta_oos_r2_ci_high
+      )
+    ) %>%
+    select(outcome, model, delta_oos_r2_ci) %>%
+    pivot_wider(
+      names_from = model,
+      values_from = delta_oos_r2_ci,
+      names_glue = "{model}_delta_oos_r2_ci"
+    ) %>%
+    mutate(
+      Concept = short_concept_map[outcome],
+      Variable = unname(setNames(short_oos_labels, short_oos_cols)[outcome]),
+      Concept = factor(Concept, levels = short_concept_order),
+      Variable = factor(Variable, levels = short_oos_labels)
+    ) %>%
+    arrange(Concept, Variable) %>%
+    mutate(
+      Variable = as.character(Variable)
+    )
+
+  st_oos_r2_condensed_cols <- c("Variable", "ST1_delta_oos_r2_ci", "ST2_delta_oos_r2_ci")
+  st_oos_r2_condensed_names <- c(
+    "Variable",
+    "ST1 Mean Delta OOS R2 (95% CI)",
+    "ST2 Mean Delta OOS R2 (95% CI)"
+  )
+
+  if (LOOP_INCLUDE_ST3 && "ST3_delta_oos_r2_ci" %in% names(st_oos_r2_condensed)) {
+    st_oos_r2_condensed_cols <- c(st_oos_r2_condensed_cols, "ST3_delta_oos_r2_ci")
+    st_oos_r2_condensed_names <- c(
+      st_oos_r2_condensed_names,
+      "ST3 Mean Delta OOS R2 (95% CI)"
+    )
+  }
+
+  st_oos_r2_condensed_display <- st_oos_r2_condensed %>%
+    select(Concept, all_of(st_oos_r2_condensed_cols))
+
+  print(st_oos_r2_condensed_display)
+
+  write_csv(
+    st_oos_r2_condensed_display,
+    file.path(output_dir, "st_oos_r2_repo_holdout_condensed.csv")
+  )
+
+  concept_counts_oos <- st_oos_r2_condensed_display %>% count(Concept)
+
+  st_oos_r2_condensed_html <- kable(
+      st_oos_r2_condensed_display %>% select(-Concept),
+      col.names = st_oos_r2_condensed_names,
+      caption = "Socio-technical Scores Repo-Held-Out OOS R2",
+      align = c("l", rep("c", length(st_oos_r2_condensed_cols) - 1L)),
+      format = "html",
+      row.names = FALSE
+    ) %>%
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      full_width = FALSE,
+      font_size = 12
+    ) %>%
+    row_spec(0, bold = TRUE, background = "#f0f0f0")
+
+  row_start <- 1
+  for (i in seq_len(nrow(concept_counts_oos))) {
+    row_end <- row_start + concept_counts_oos$n[i] - 1
+    st_oos_r2_condensed_html <- st_oos_r2_condensed_html %>%
+      pack_rows(as.character(concept_counts_oos$Concept[i]), row_start, row_end)
+    row_start <- row_end + 1
+  }
+
+  st_oos_r2_condensed_html_path <- file.path(output_dir, "st_oos_r2_repo_holdout_condensed.html")
+  save_kable(st_oos_r2_condensed_html, st_oos_r2_condensed_html_path)
+  cat("Saved:", st_oos_r2_condensed_html_path, "\n")
+
+  st_oos_r2_condensed_docx <- st_oos_r2_condensed_display %>%
+    mutate(Concept = as.character(Concept)) %>%
+    group_by(Concept) %>%
+    group_modify(~ bind_rows(
+      tibble(
+        Variable = .y$Concept,
+        !!!setNames(rep(list(""), length(st_oos_r2_condensed_cols) - 1L),
+                    st_oos_r2_condensed_cols[-1])
+      ),
+      .x %>% select(all_of(st_oos_r2_condensed_cols))
+    )) %>%
+    ungroup() %>%
+    select(all_of(st_oos_r2_condensed_cols))
+
+  st_oos_r2_header_labels <- c(
+    Variable = "Variable",
+    ST1_delta_oos_r2_ci = "ST1 Mean Delta OOS R2 (95% CI)",
+    ST2_delta_oos_r2_ci = "ST2 Mean Delta OOS R2 (95% CI)",
+    ST3_delta_oos_r2_ci = "ST3 Mean Delta OOS R2 (95% CI)"
+  )
+  st_oos_r2_header_labels <- st_oos_r2_header_labels[
+    names(st_oos_r2_header_labels) %in% names(st_oos_r2_condensed_docx)
+  ]
+
+  st_oos_r2_condensed_ft <- flextable::flextable(st_oos_r2_condensed_docx)
+  st_oos_r2_condensed_ft <- do.call(
+    flextable::set_header_labels,
+    c(list(st_oos_r2_condensed_ft), as.list(st_oos_r2_header_labels))
+  ) %>%
+    flextable::bold(i = which(st_oos_r2_condensed_docx$Variable %in% short_concept_order), bold = TRUE) %>%
+    flextable::autofit()
+
+  flextable::save_as_docx(
+    st_oos_r2_condensed_ft,
+    path = file.path(output_dir, "st_oos_r2_repo_holdout_condensed.docx")
+  )
+
+  if (knitr::is_html_output()) {
+    st_oos_r2_condensed_html
+  } else {
+    st_oos_r2_condensed_ft
+  }
+}
+```
+
+## Condensed Supplier Count Effects (With ST Scores)
+
+The following condensed table extracts the `technical_supplier_count` and `social_supplier_count` coefficients from the ST1 and ST2 models for the same selected target variables used in the condensed ST-score summary above.
+
+```{r condensed-st-supplier-count-table}
+if (length(results_summary) > 0) {
+
+  short_cols_sup     <- sapply(short_form_targets, `[[`, "col")
+  short_labels_sup_v <- sapply(short_form_targets, `[[`, "label")
+
+  available_short_sup <- short_cols_sup[short_cols_sup %in% names(results_summary)]
+
+  if (length(available_short_sup) == 0) {
+    cat("No condensed-table targets found in results_summary — skipping.\n")
+  } else {
+    pull_sup_field <- function(field) {
+      sapply(results_summary[available_short_sup], function(x) {
+        v <- x[[field]]
+        if (is.null(v)) NA_character_ else v
+      })
+    }
+
+    short_sup_df <- data.frame(
+      Target_Variable = available_short_sup,
+      Concept         = short_concept_map[available_short_sup],
+      ST1_Tech        = pull_sup_field("st1_tech"),
+      ST1_Soc         = pull_sup_field("st1_soc"),
+      ST2_Tech        = pull_sup_field("st2_tech"),
+      ST2_Soc         = pull_sup_field("st2_soc"),
+      stringsAsFactors = FALSE
+    )
+
+    label_lookup_sup <- setNames(short_labels_sup_v, short_cols_sup)
+    short_sup_df$Target_Variable <- unname(label_lookup_sup[short_sup_df$Target_Variable])
+
+    short_sup_df$Concept         <- factor(short_sup_df$Concept,         levels = short_concept_order)
+    short_sup_df$Target_Variable <- factor(short_sup_df$Target_Variable, levels = short_labels_sup_v)
+    short_sup_df <- short_sup_df[order(short_sup_df$Concept, short_sup_df$Target_Variable), ]
+
+    concept_counts_short_sup <- short_sup_df %>% count(Concept)
+
+    sup_note <- paste0(
+      "Supplier count coefficients extracted from models that include ST1 and ST2 scores respectively. ",
+      "All variables log-transformed",
+      if (STANDARDIZE_VARS) " and z-score standardised (beta coefficients)" else "",
+      ". Robust two-way cluster SEs. Fixed effects: repo_id + month. ",
+      "Cell format: Estimate (SE). * p<0.1, ** p<0.05, *** p<0.01."
+    )
+
+    short_sup_html <- kable(
+        short_sup_df %>%
+          select(Target_Variable, ST1_Tech, ST1_Soc, ST2_Tech, ST2_Soc),
+        col.names   = c("Target Variable",
+                        "Tech Supplier Count", "Social Supplier Count",
+                        "Tech Supplier Count", "Social Supplier Count"),
+        caption     = "Condensed Supplier Count Effects in Models With ST Scores",
+        align       = c("l", "c", "c", "c", "c"),
+        format      = "html",
+        row.names   = FALSE
+      ) %>%
+      kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed"),
+        full_width        = FALSE,
+        font_size         = 12
+      ) %>%
+      row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+      add_header_above(c(" " = 1,
+                         "ST1: Supplier Coverage" = 2,
+                         "ST2: Developer Coverage" = 2)) %>%
+      kableExtra::footnote(
+        general       = sup_note,
+        general_title = "Note:",
+        footnote_as_chunk = TRUE
+      )
+
+    row_start_s <- 1
+    for (i in seq_len(nrow(concept_counts_short_sup))) {
+      row_end_s    <- row_start_s + concept_counts_short_sup$n[i] - 1
+      short_sup_html <- short_sup_html %>%
+        pack_rows(as.character(concept_counts_short_sup$Concept[i]), row_start_s, row_end_s)
+      row_start_s <- row_end_s + 1
+    }
+
+    short_sup_html_path <- file.path(output_dir, "summary_table_condensed_supplier_counts.html")
+    save_kable(short_sup_html, short_sup_html_path)
+    cat("Saved:", short_sup_html_path, "\n")
+
+    if (knitr::is_html_output()) {
+      short_sup_html
+    } else {
+      kable(
+        short_sup_df %>%
+          select(Concept, Target_Variable, ST1_Tech, ST1_Soc, ST2_Tech, ST2_Soc),
+        col.names   = c("Concept", "Target Variable",
+                        "Tech (ST1)", "Social (ST1)",
+                        "Tech (ST2)", "Social (ST2)"),
+        caption     = "Condensed Supplier Count Effects in Models With ST Scores",
+        align       = c("l", "l", "c", "c", "c", "c"),
+        row.names   = FALSE
+      )
+    }
+  }
+}
+```
+
+## Condensed ST Results with Inline Supplier Count Estimates
+
+The following table builds on the condensed ST summary above (same 4 responsiveness, 3 contributor engagement, and 3 knowledge-production targets) but appends the `technical_supplier_count` (TSC) and `social_supplier_count` (SSC) estimates — each with their own significance stars — directly inside the brackets after the standard error. Cell format: `ST Estimate[ST stars] (SE, TSC: estimate[stars], SSC: estimate[stars])`.
+
+```{r condensed-combined-st-supplier-table}
+# ── Helpers ───────────────────────────────────────────────────────────────────
+# Extract numeric estimate string and trailing significance stars from a
+# format_st_result() string like "0.0430 (0.0120)**" or "-0.0430 (0.0120, Adj. R2: 0.234)***"
+parse_est_stars <- function(s) {
+  if (is.null(s) || length(s) == 0 || is.na(s) || s == "NA") {
+    return(list(est = NA_character_, stars = ""))
+  }
+  est_m   <- regmatches(s, regexpr("^-?[0-9]+\\.[0-9]+", s))
+  est     <- if (length(est_m) == 0) NA_character_ else est_m
+  stars_m <- regmatches(s, regexpr("[*]+$", s))
+  stars   <- if (length(stars_m) == 0) "" else stars_m
+  list(est = est, stars = stars)
+}
+
+# Build one combined cell string from three format_st_result() strings
+build_combined_cell <- function(st_str, tech_str, soc_str) {
+  if (is.null(st_str) || length(st_str) == 0 || is.na(st_str) || st_str == "NA") return("\u2014")
+
+  # Parse main ST: extract estimate, SE, and trailing stars
+  m <- regmatches(st_str, regexec("^(-?[0-9]+\\.[0-9]+) \\((-?[0-9]+\\.[0-9]+)", st_str))[[1]]
+  if (length(m) < 3) return(st_str)
+  coef_s     <- m[2]
+  se_s       <- m[3]
+  star_pos   <- regexpr("[*]+$", st_str)
+  main_stars <- if (star_pos == -1) "" else regmatches(st_str, star_pos)
+
+  tsc <- parse_est_stars(tech_str)
+  soc <- parse_est_stars(soc_str)
+
+  tsc_part <- if (!is.na(tsc$est)) paste0("TSC: ", tsc$est, tsc$stars) else "TSC: \u2014"
+  soc_part <- if (!is.na(soc$est)) paste0("SSC: ", soc$est, soc$stars) else "SSC: \u2014"
+
+  paste0(coef_s, main_stars, " (", se_s, ", ", tsc_part, ", ", soc_part, ")")
+}
+
+if (length(results_summary) > 0) {
+
+  available_short_comb <- short_cols[short_cols %in% names(results_summary)]
+
+  if (length(available_short_comb) == 0) {
+    cat("No condensed-table targets found in results_summary — skipping.\n")
+  } else {
+    comb_df <- data.frame(
+      Target_Variable = available_short_comb,
+      Concept         = short_concept_map[available_short_comb],
+      stringsAsFactors = FALSE
+    )
+
+    comb_df$ST1_Combined <- mapply(
+      build_combined_cell,
+      sapply(results_summary[available_short_comb], function(x) x$st1),
+      sapply(results_summary[available_short_comb], function(x) x$st1_tech),
+      sapply(results_summary[available_short_comb], function(x) x$st1_soc)
+    )
+    comb_df$ST2_Combined <- mapply(
+      build_combined_cell,
+      sapply(results_summary[available_short_comb], function(x) x$st2),
+      sapply(results_summary[available_short_comb], function(x) x$st2_tech),
+      sapply(results_summary[available_short_comb], function(x) x$st2_soc)
+    )
+
+    label_lookup_comb   <- setNames(short_labels_v, short_cols)
+    comb_df$Target_Variable <- unname(label_lookup_comb[comb_df$Target_Variable])
+
+    comb_df$Concept         <- factor(comb_df$Concept,         levels = short_concept_order)
+    comb_df$Target_Variable <- factor(comb_df$Target_Variable, levels = short_labels_v)
+    comb_df <- comb_df[order(comb_df$Concept, comb_df$Target_Variable), ]
+
+    concept_counts_comb <- comb_df %>% count(Concept)
+
+    comb_note <- paste0(
+      "ST coefficients shown with standard errors (SE) in parentheses. ",
+      "TSC = technical_supplier_count estimate (with significance stars); ",
+      "SSC = social_supplier_count estimate (with significance stars), ",
+      "both from the same model as the ST coefficient. ",
+      "Cell format: ST Estimate[ST stars] (SE, TSC: estimate[stars], SSC: estimate[stars]). ",
+      "All variables log-transformed",
+      if (STANDARDIZE_VARS) " and z-score standardised (beta coefficients)" else "",
+      ". Robust two-way cluster SEs. Fixed effects: repo_id + month. ",
+      "* p<0.1, ** p<0.05, *** p<0.01."
+    )
+
+    comb_html <- kable(
+        comb_df %>% select(Target_Variable, ST1_Combined, ST2_Combined),
+        col.names   = c("Target Variable",
+                        "ST1: Supplier Coverage",
+                        "ST2: Developer Coverage"),
+        caption     = "Condensed ST Results with Inline Supplier Count Estimates",
+        align       = c("l", "c", "c"),
+        format      = "html",
+        row.names   = FALSE
+      ) %>%
+      kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed"),
+        full_width        = FALSE,
+        font_size         = 12
+      ) %>%
+      row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+      add_header_above(c(" " = 1, "Socio-Technical Metrics with Supplier Counts (Log-Transformed)" = 2)) %>%
+      kableExtra::footnote(
+        general       = comb_note,
+        general_title = "Note:",
+        footnote_as_chunk = TRUE
+      )
+
+    row_start_comb <- 1
+    for (i in seq_len(nrow(concept_counts_comb))) {
+      row_end_comb   <- row_start_comb + concept_counts_comb$n[i] - 1
+      comb_html <- comb_html %>%
+        pack_rows(as.character(concept_counts_comb$Concept[i]), row_start_comb, row_end_comb)
+      row_start_comb <- row_end_comb + 1
+    }
+
+    comb_html_path <- file.path(output_dir, "summary_table_condensed_combined.html")
+    save_kable(comb_html, comb_html_path)
+    cat("Saved:", comb_html_path, "\n")
+
+    if (knitr::is_html_output()) {
+      comb_html
+    } else {
+      kable(
+        comb_df %>% select(Concept, Target_Variable, ST1_Combined, ST2_Combined),
+        col.names   = c("Concept", "Target Variable",
+                        "ST1: Supplier Coverage", "ST2: Developer Coverage"),
+        caption     = "Condensed ST Results with Inline Supplier Count Estimates",
+        align       = c("l", "l", "c", "c"),
+        row.names   = FALSE
+      )
+    }
+  }
+}
+```
+
+## Supplier Count Effects (No ST Scores)
+
+The following table re-runs every target-variable model **without any ST scores** (ST1 / ST2 / ST3) and reports only the estimates and significance of `technical_supplier_count` and `social_supplier_count`. All other modelling choices (fixed effects, vcov, log-transformation, control variables, CNCF status filter) are identical to the main loop above.
+
+```{r supplier-count-models}
+# ── Controls: same as main loop, but with ST scores removed ──────────────────
+supplier_control_vars_base <- control_vars_base
+# (technical_supplier_count and social_supplier_count are already in
+#  control_vars_base; they become the focal predictors here)
+
+supplier_results_summary <- list()
+
+for (target_var in target_variables_to_test) {
+
+  target_var_text <- unname(target_display_labels[target_var])
+  if (is.na(target_var_text) || target_var_text == "") {
+    target_var_text <- gsub("_", " ", gsub(t_plus_n_suffix, "", target_var))
+  }
+
+  cat("\nProcessing:", target_var_text, "\n")
+
+  # ── Skip if target column is missing ────────────────────────────────────────
+  if (!target_var %in% names(panel_data)) {
+    cat("  ✗ Column not found - SKIPPING\n")
+    next
+  }
+
+  # ── Concept-specific control adjustment (mirror main loop) ──────────────────
+  concept_for_target <- concept_map_targets[target_var]
+  supplier_control_vars_loop <- supplier_control_vars_base
+  if (!is.na(concept_for_target) && concept_for_target == "Community") {
+    supplier_control_vars_loop <- setdiff(supplier_control_vars_loop, community_control_vars)
+  }
+  # Add open issues/PRs count at t as a control for all models
+  if (ADD_OPEN_ISSUES_CONTROL) {
+    if (OPEN_ISSUES_CTRL %in% names(panel_data)) {
+      supplier_control_vars_loop <- unique(c(supplier_control_vars_loop, OPEN_ISSUES_CTRL))
+    }
+    if (OPEN_PRS_CTRL %in% names(panel_data)) {
+      supplier_control_vars_loop <- unique(c(supplier_control_vars_loop, OPEN_PRS_CTRL))
+    }
+  }
+
+  # ── Build complete cases for this target ────────────────────────────────────
+  needed_vars <- c(
+    target_var,
+    supplier_control_vars_loop,
+    "repo_id", "month", "target_month",
+    if (LOOP_FILTER_BY_GROUP) loop_status_var else NULL
+  )
+  available_vars <- intersect(needed_vars, names(panel_data))
+  panel_complete_sup <- panel_data %>%
+    select(all_of(available_vars)) %>%
+    filter(!is.na(!!sym(target_var))) %>%
+    filter(target_month <= as.Date("2026-01-01"))
+
+  for (var in supplier_control_vars_loop) {
+    if (var %in% names(panel_complete_sup)) {
+      panel_complete_sup <- panel_complete_sup %>%
+        filter(!is.na(!!sym(var)))
+    }
+  }
+
+  if (LOOP_FILTER_BY_GROUP) {
+    panel_complete_sup <- panel_complete_sup %>%
+      filter(.data[[loop_status_var]] == LOOP_GROUP_SUBSET)
+  }
+
+  cat("  Complete cases:", nrow(panel_complete_sup), "\n")
+
+  if (nrow(panel_complete_sup) < 100) {
+    cat("  ✗ Insufficient data - SKIPPING\n")
+    next
+  }
+
+  # ── Build formula (respects use_log and STANDARDIZE_VARS) ──────────────────
+  other_controls <- setdiff(
+    supplier_control_vars_loop,
+    c("technical_supplier_count", "social_supplier_count")
+  )
+  if (STANDARDIZE_VARS) {
+    all_sup_vars <- unique(c(target_var, "technical_supplier_count",
+                             "social_supplier_count", other_controls))
+    sup_df_std <- panel_complete_sup
+    for (v in all_sup_vars) {
+      if (v %in% names(sup_df_std) && is.numeric(sup_df_std[[v]])) {
+        raw_vals <- if (use_log) log1p(sup_df_std[[v]]) else sup_df_std[[v]]
+        sup_df_std[[paste0("zs_", v)]] <- as.numeric(scale(raw_vals))
+      }
+    }
+    dep_var_formula  <- paste0("zs_", target_var)
+    focal_predictors <- c("zs_technical_supplier_count", "zs_social_supplier_count")
+    other_rhs <- if (length(other_controls) > 0) {
+      paste(paste0("zs_", other_controls), collapse = " + ")
+    } else {
+      ""
+    }
+    data_for_model <- sup_df_std
+    tech_coef_name <- "zs_technical_supplier_count"
+    soc_coef_name  <- "zs_social_supplier_count"
+  } else if (use_log) {
+    dep_var_formula  <- paste0("log1p(", target_var, ")")
+    focal_predictors <- c("log1p(technical_supplier_count)", "log1p(social_supplier_count)")
+    other_rhs <- if (length(other_controls) > 0) {
+      paste(paste0("log1p(", other_controls, ")"), collapse = " + ")
+    } else {
+      ""
+    }
+    data_for_model <- panel_complete_sup
+    tech_coef_name <- "log1p(technical_supplier_count)"
+    soc_coef_name  <- "log1p(social_supplier_count)"
+  } else {
+    dep_var_formula  <- target_var
+    focal_predictors <- c("technical_supplier_count", "social_supplier_count")
+    other_rhs <- if (length(other_controls) > 0) {
+      paste(other_controls, collapse = " + ")
+    } else {
+      ""
+    }
+    data_for_model <- panel_complete_sup
+    tech_coef_name <- "technical_supplier_count"
+    soc_coef_name  <- "social_supplier_count"
+  }
+  rhs <- paste(
+    c(focal_predictors, if (nzchar(other_rhs)) other_rhs else NULL),
+    collapse = " + "
+  )
+  fe_str  <- "repo_id + month"
+  formula_sup <- as.formula(paste(dep_var_formula, "~", rhs, "|", fe_str))
+
+  tryCatch({
+    model_sup <- fixest::feols(
+      formula_sup,
+      data  = data_for_model,
+      vcov  = "twoway"
+    )
+
+    coefs  <- coef(model_sup)
+    vcovM  <- vcov(model_sup)
+    ses    <- sqrt(diag(vcovM))
+
+    # ── Helper: pull est/SE/p for one predictor name ─────────────────────────
+    extract_coef_info <- function(pred_name) {
+      if (!pred_name %in% names(coefs)) {
+        return(list(est = NA_real_, se = NA_real_, pval = NA_real_))
+      }
+      est  <- coefs[pred_name]
+      se   <- ses[pred_name]
+      tval <- est / se
+      df   <- model_sup$nobs - length(coefs)
+      pval <- 2 * pt(abs(tval), df = max(df, 1), lower.tail = FALSE)
+      list(est = est, se = se, pval = pval)
+    }
+
+    tech <- extract_coef_info(tech_coef_name)
+    soc  <- extract_coef_info(soc_coef_name)
+
+    # Adj R² for reference (optional, controlled by INCLUDE_ADJ_R2_IN_TABLES)
+    adjr2_val <- tryCatch(
+      unname(r2(model_sup, type = "ar2")),
+      error = function(e) NA_real_
+    )
+
+    supplier_results_summary[[target_var]] <- list(
+      target       = target_var,
+      tech_result  = format_st_result(tech$est, tech$se, tech$pval, adjr2_val),
+      soc_result   = format_st_result(soc$est,  soc$se,  soc$pval,  adjr2_val),
+      n_obs        = nrow(panel_complete_sup)
+    )
+
+    cat("  ✔ Completed:", target_var, "\n")
+
+  }, error = function(e) {
+    cat("  ✗ ERROR:", conditionMessage(e), "\n")
+  })
+}
+
+cat("\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+cat("SUPPLIER COUNT MODELS COMPLETE\n")
+cat("=" %>% rep(80) %>% paste(collapse = ""), "\n")
+```
+
+```{r supplier-count-summary-table}
+if (length(supplier_results_summary) > 0) {
+
+  concept_order <- c("Responsiveness", "Community", "Growth")
+
+  target_vector_sup <- sapply(supplier_results_summary, function(x) x$target)
+
+  supplier_summary_df <- data.frame(
+    Target_Variable          = target_vector_sup,
+    Concept                  = concept_map_targets[target_vector_sup],
+    Technical_Supplier_Count = sapply(supplier_results_summary, function(x) x$tech_result),
+    Social_Supplier_Count    = sapply(supplier_results_summary, function(x) x$soc_result),
+    N_Obs                    = sapply(supplier_results_summary, function(x) x$n_obs),
+    stringsAsFactors         = FALSE
+  )
+
+  # ── Apply display labels & ordering (mirrors main summary table) ─────────────
+  supplier_summary_df$Target_Variable <- unname(target_display_labels[supplier_summary_df$Target_Variable])
+  missing_labels_sup <- is.na(supplier_summary_df$Target_Variable)
+  supplier_summary_df$Target_Variable[missing_labels_sup] <- gsub(
+    "_", " ", gsub(t_plus_n_suffix, "", target_vector_sup[missing_labels_sup])
+  )
+
+  target_order_labels_sup <- unname(target_display_labels[target_variables_to_test])
+  missing_order_sup <- is.na(target_order_labels_sup)
+  target_order_labels_sup[missing_order_sup] <- gsub(
+    "_", " ", gsub(t_plus_n_suffix, "", target_variables_to_test[missing_order_sup])
+  )
+
+  supplier_summary_df$Concept         <- factor(supplier_summary_df$Concept, levels = concept_order)
+  supplier_summary_df$Target_Variable <- factor(
+    supplier_summary_df$Target_Variable,
+    levels = unique(target_order_labels_sup)
+  )
+  supplier_summary_df <- supplier_summary_df[
+    order(supplier_summary_df$Concept, supplier_summary_df$Target_Variable), ]
+
+  concept_counts_sup <- supplier_summary_df %>% count(Concept)
+
+  # ── Build kable ──────────────────────────────────────────────────────────────
+  supplier_note <- paste0(
+    "Models exclude all ST scores (ST1/ST2/ST3). ",
+    "Controls: log1p(cumulative_stars_t), log1p(cumulative_forks_t), log1p(age_in_months_t). ",
+    "Fixed effects: repo_id + month. Cluster-robust (two-way) SEs. ",
+    "Cell format: Estimate (SE)",
+    if (INCLUDE_ADJ_R2_IN_TABLES) ", Adj. R²" else "",
+    ". * p<0.1, ** p<0.05, *** p<0.01."
+  )
+
+  html_table_sup <- kable(
+    supplier_summary_df %>%
+      select(Target_Variable, Technical_Supplier_Count, Social_Supplier_Count),
+    col.names  = c("Target Variable",
+                   "Technical Supplier Count",
+                   "Social Supplier Count"),
+    caption    = "Supplier Count Effects: Models Without ST Scores (Log-Transformed)",
+    align      = c("l", "c", "c"),
+    format     = "html",
+    row.names  = FALSE
+  ) %>%
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      full_width        = FALSE,
+      font_size         = 12
+    ) %>%
+    row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+    add_header_above(c(" " = 1, "Control Variables (Focal Predictors)" = 2)) %>%
+    kableExtra::footnote(
+      general       = supplier_note,
+      general_title = "Note:",
+      footnote_as_chunk = TRUE
+    )
+
+  # Add concept group rows
+  row_start_sup <- 1
+  for (i in seq_len(nrow(concept_counts_sup))) {
+    row_end_sup <- row_start_sup + concept_counts_sup$n[i] - 1
+    html_table_sup <- html_table_sup %>%
+      pack_rows(as.character(concept_counts_sup$Concept[i]), row_start_sup, row_end_sup)
+    row_start_sup <- row_end_sup + 1
+  }
+
+  save_kable(html_table_sup, file.path(output_dir, "summary_table_supplier_counts.html"))
+  cat("Saved:", file.path(output_dir, "summary_table_supplier_counts.html"), "\n")
+
+  if (knitr::is_html_output()) {
+    html_table_sup
+  } else {
+    kable(
+      supplier_summary_df %>%
+        select(Concept, Target_Variable, Technical_Supplier_Count, Social_Supplier_Count),
+      col.names  = c("Concept", "Target Variable",
+                     "Technical Supplier Count", "Social Supplier Count"),
+      caption    = "Supplier Count Effects: Models Without ST Scores",
+      align      = c("l", "l", "c", "c"),
+      row.names  = FALSE
+    )
+  }
+}
+```
+
+## Supplier Count Effects (With ST Scores)
+
+The following table extracts the estimates and significance of `technical_supplier_count` and `social_supplier_count` from the **same models that include the ST scores** (ST1 / ST2 / ST3). This lets you compare how the supplier count control variables behave alongside the ST measures. All modelling choices (fixed effects, vcov, log-transformation, CNCF status filter) are identical to the main loop above.
+
+```{r st-supplier-count-summary-table}
+if (length(results_summary) > 0) {
+
+  concept_order <- c("Responsiveness", "Community", "Growth")
+
+  target_vector_st_sup <- sapply(results_summary, function(x) x$target)
+
+  # ── Build data frame ─────────────────────────────────────────────────────────
+  st_sup_df <- data.frame(
+    Target_Variable = target_vector_st_sup,
+    Concept         = concept_map_targets[target_vector_st_sup],
+    stringsAsFactors = FALSE
+  )
+
+  pull_field <- function(field) {
+    sapply(results_summary, function(x) {
+      v <- x[[field]]
+      if (is.null(v)) NA_character_ else v
+    })
+  }
+
+  st_sup_df$ST1_Tech <- pull_field("st1_tech")
+  st_sup_df$ST1_Soc  <- pull_field("st1_soc")
+  st_sup_df$ST2_Tech <- pull_field("st2_tech")
+  st_sup_df$ST2_Soc  <- pull_field("st2_soc")
+  if (LOOP_INCLUDE_ST3) {
+    st_sup_df$ST3_Tech <- pull_field("st3_tech")
+    st_sup_df$ST3_Soc  <- pull_field("st3_soc")
+  }
+
+  # ── Apply display labels & ordering (mirrors main summary table) ─────────────
+  st_sup_df$Target_Variable <- unname(target_display_labels[st_sup_df$Target_Variable])
+  missing_st_sup <- is.na(st_sup_df$Target_Variable)
+  st_sup_df$Target_Variable[missing_st_sup] <- gsub(
+    "_", " ", gsub(t_plus_n_suffix, "", target_vector_st_sup[missing_st_sup])
+  )
+
+  target_order_st_sup <- unname(target_display_labels[target_variables_to_test])
+  missing_order_st_sup <- is.na(target_order_st_sup)
+  target_order_st_sup[missing_order_st_sup] <- gsub(
+    "_", " ", gsub(t_plus_n_suffix, "", target_variables_to_test[missing_order_st_sup])
+  )
+
+  st_sup_df$Concept         <- factor(st_sup_df$Concept, levels = concept_order)
+  st_sup_df$Target_Variable <- factor(
+    st_sup_df$Target_Variable, levels = unique(target_order_st_sup)
+  )
+  st_sup_df <- st_sup_df[order(st_sup_df$Concept, st_sup_df$Target_Variable), ]
+
+  concept_counts_st_sup <- st_sup_df %>% count(Concept)
+
+  # ── Column specs (dynamic based on whether ST3 is included) ─────────────────
+  if (LOOP_INCLUDE_ST3) {
+    data_cols     <- c("Target_Variable",
+                       "ST1_Tech", "ST1_Soc",
+                       "ST2_Tech", "ST2_Soc",
+                       "ST3_Tech", "ST3_Soc")
+    col_names_out <- c("Target Variable",
+                       "Tech. Supplier", "Social Supplier",
+                       "Tech. Supplier", "Social Supplier",
+                       "Tech. Supplier", "Social Supplier")
+    header_above  <- c(" " = 1, "ST1 Model" = 2, "ST2 Model" = 2, "ST3 Model" = 2)
+  } else {
+    data_cols     <- c("Target_Variable",
+                       "ST1_Tech", "ST1_Soc",
+                       "ST2_Tech", "ST2_Soc")
+    col_names_out <- c("Target Variable",
+                       "Tech. Supplier", "Social Supplier",
+                       "Tech. Supplier", "Social Supplier")
+    header_above  <- c(" " = 1, "ST1 Model" = 2, "ST2 Model" = 2)
+  }
+
+  st_sup_note <- paste0(
+    "Supplier count coefficients extracted from models that include ST scores (ST1/ST2/ST3 respectively). ",
+    "All variables log-transformed",
+    if (STANDARDIZE_VARS) " and z-score standardised (beta coefficients)" else "",
+    ". Robust two-way cluster SEs. Fixed effects: repo_id + month. ",
+    "Cell format: Estimate (SE)",
+    if (INCLUDE_ADJ_R2_IN_TABLES) ", Adj. R\u00b2" else "",
+    ". * p<0.1, ** p<0.05, *** p<0.01."
+  )
+
+  html_table_st_sup <- kable(
+    st_sup_df %>% select(all_of(data_cols)),
+    col.names  = col_names_out,
+    caption    = "Supplier Count Effects in Models WITH ST Scores (Log-Transformed)",
+    align      = c("l", rep("c", length(data_cols) - 1)),
+    format     = "html",
+    row.names  = FALSE
+  ) %>%
+    kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"),
+      full_width        = FALSE,
+      font_size         = 12
+    ) %>%
+    row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+    add_header_above(header_above) %>%
+    kableExtra::footnote(
+      general       = st_sup_note,
+      general_title = "Note:",
+      footnote_as_chunk = TRUE
+    )
+
+  row_start_st_sup <- 1
+  for (i in seq_len(nrow(concept_counts_st_sup))) {
+    row_end_st_sup <- row_start_st_sup + concept_counts_st_sup$n[i] - 1
+    html_table_st_sup <- html_table_st_sup %>%
+      pack_rows(as.character(concept_counts_st_sup$Concept[i]), row_start_st_sup, row_end_st_sup)
+    row_start_st_sup <- row_end_st_sup + 1
+  }
+
+  save_kable(html_table_st_sup,
+             file.path(output_dir, "summary_table_supplier_counts_with_st.html"))
+  cat("Saved:", file.path(output_dir, "summary_table_supplier_counts_with_st.html"), "\n")
+
+  if (knitr::is_html_output()) {
+    html_table_st_sup
+  } else {
+    kable(
+      st_sup_df %>% select(Concept, all_of(data_cols)),
+      col.names  = c("Concept", col_names_out),
+      caption    = "Supplier Count Effects in Models WITH ST Scores",
+      align      = c("l", "l", rep("c", length(data_cols) - 1)),
+      row.names  = FALSE
+    )
+  }
+}
+```
