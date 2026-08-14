@@ -82,13 +82,3 @@ This release contains aggregate project-month measures only. It intentionally ex
 ## License and reuse
 
 Unless a file states otherwise, this repository is licensed under [Creative Commons Attribution-ShareAlike 4.0 International](https://creativecommons.org/licenses/by-sa/4.0/). Reusers must give appropriate attribution, link to the license, indicate changes, and distribute adaptations under the same or a compatible license. The license does not itself grant rights to third-party data, trademarks, or privacy rights.
-
-## Before publishing to GitHub
-
-Run the local publication check below and review the staged diff before pushing:
-
-```powershell
-rg -n -i "ghp_|github_pat_|api[_-]?key|password\s*=|secret\s*=|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}" .
-```
-
-No remote repository is created by this package. Create an empty GitHub repository, copy these files to its root, review the diff, and push with your normal institutional Git workflow.
