@@ -1,4 +1,4 @@
-# Augur Socio-technical Data Framework
+# Socio-technical Data Framework
 
 This repository contains a reproducible, sanitized snapshot of a project-level open-source software data framework. It connects aggregate metrics extracted from a local [Augur](https://oss-augur.readthedocs.io/) instance with socio-technical scores and CNCF project-status metadata, then produces the panel used for the socio-technical analysis.
 
